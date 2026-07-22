@@ -1,0 +1,3 @@
+[console_scripts]
+parse-wad = cli.parse_wad:main
+tag-maps = cli.tag_maps:main

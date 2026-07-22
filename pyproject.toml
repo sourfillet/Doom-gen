@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "doom-gen"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.0",
+    "torch-geometric",
+    "numpy>=1.24",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+parse-wad = "cli.parse_wad:main"
+tag-maps  = "cli.tag_maps:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wad_parser*", "data*", "cli*", "models*", "generation*", "wad_writer*"]

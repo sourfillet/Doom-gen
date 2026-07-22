@@ -1,0 +1,10 @@
+click>=8.0
+
+[dev]
+pytest>=7.0
+pytest-cov
+
+[ml]
+torch>=2.0
+torch-geometric
+numpy>=1.24
