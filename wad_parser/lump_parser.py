@@ -5,7 +5,7 @@ import struct
 
 from wad_parser.types import (
     LinedefFlags, Sector, Sidedef, Thing, ThingFlags, Vertex,
-    resolve_doomed,
+    resolve_doomed, resolve_linedef_special, resolve_hexen_special,
 )
 
 
@@ -67,11 +67,13 @@ _LINEDEF_FLAG_BITS: list[tuple[int, str]] = [
     (0x0040, "blocks_sound"),
     (0x0080, "not_on_map"),
     (0x0100, "already_on_map"),
-    (0x0200, "pass_through"),        # Boom
-    (0x0400, "translucent_25"),      # Boom (bit 10)
-    (0x0800, "translucent_75"),      # Boom (bit 11, combined w/ above = 3D midtex etc.)
+    (0x0200, "pass_through"),        # Boom (ML_PASSUSE)
     (0x1000, "block_land_monsters"),  # MBF21
     (0x2000, "block_players"),        # MBF21
+    # Bits 0x0400/0x0800 exist in some ports' extended flag words but don't
+    # have a single settled cross-port meaning worth asserting here; they
+    # fall through to `unrecognized_flag_bits` below rather than being
+    # mislabeled.
 ]
 _KNOWN_FLAG_MASK = 0
 for _bit, _ in _LINEDEF_FLAG_BITS:
@@ -96,10 +98,12 @@ def parse_linedefs_doom(data: bytes) -> list:
         off = i * 14
         v1, v2, raw_flags, special, tag, right, left = struct.unpack_from("<HHHHHHH", data, off)
         flags, extra = _decode_linedef_flags(raw_flags)
+        special_name, trigger_type = resolve_linedef_special(special)
         out.append(Linedef(
             id=i, v1=v1, v2=v2, flags=flags, special=special, tag=tag,
             right_sidedef=right if right != 0xFFFF else -1,
             left_sidedef=left if left != 0xFFFF else -1,
+            special_name=special_name, trigger_type=trigger_type,
             extra=extra,
         ))
     return out
@@ -116,11 +120,13 @@ def parse_linedefs_hexen(data: bytes) -> list:
         args = list(data[off + 7: off + 12])
         right, left = struct.unpack_from("<HH", data, off + 12)
         flags, extra = _decode_linedef_flags(raw_flags)
+        special_name, trigger_type = resolve_hexen_special(special)
         out.append(Linedef(
             id=i, v1=v1, v2=v2, flags=flags, special=special, tag=0,
             right_sidedef=right if right != 0xFFFF else -1,
             left_sidedef=left if left != 0xFFFF else -1,
-            args=args, extra=extra,
+            args=args, special_name=special_name, trigger_type=trigger_type,
+            extra=extra,
         ))
     return out
 

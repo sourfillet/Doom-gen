@@ -100,8 +100,12 @@ class WadFile:
                 i += 1
         return groups
 
-    def find_flat_names(self) -> list[str]:
-        names: list[str] = []
+    def find_flats(self) -> dict[str, bytes]:
+        """Raw indexed-pixel bytes for every flat between F_START/F_END (or
+        FF_START/FF_END) - see plan/data-model.md's requirement that flat
+        pixel data be captured, not just the flat's name.
+        """
+        flats: dict[str, bytes] = {}
         lump_names = self.lump_names()
         for start_marker, end_marker in FLAT_MARKERS:
             try:
@@ -111,8 +115,11 @@ class WadFile:
                 continue
             for l in self.lumps[start + 1: end]:
                 if l.name and l.data:  # skip sub-markers like F1_START
-                    names.append(l.name)
-        return names
+                    flats[l.name] = l.data
+        return flats
+
+    def find_flat_names(self) -> list[str]:
+        return list(self.find_flats().keys())
 
     def get_lump(self, name: str) -> bytes | None:
         for l in self.lumps:

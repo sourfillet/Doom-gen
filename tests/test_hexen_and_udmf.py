@@ -36,6 +36,10 @@ def test_hexen_thing_and_linedef_fields(tmp_path):
     door_line = doc.linedefs[3]
     assert door_line.special == 12
     assert door_line.args == [16, 35, 0, 0, 0]
+    # Hexen special 12 is Door_Raise in the Hexen action-special numbering -
+    # must NOT be resolved via the vanilla-Doom LINEDEF_SPECIAL_TABLE, which
+    # has a different (and wrong, for this format) name for special 12.
+    assert door_line.special_name == "Door_Raise"
 
 
 def test_udmf_parses_to_same_field_shapes(tmp_path):
@@ -59,6 +63,9 @@ def test_udmf_parses_to_same_field_shapes(tmp_path):
     assert triggered_line.special == 1
     assert triggered_line.tag == 5
     assert triggered_line.args == [16, 0, 0, 0, 0]
+    # namespace = "zdoom" -> Hexen-style action-special numbering, not
+    # vanilla Doom's (where special 1 means something unrelated).
+    assert triggered_line.special_name == "Polyobj_StartLine"
 
     sector = doc.sectors[0]
     assert sector.floor_slope is not None

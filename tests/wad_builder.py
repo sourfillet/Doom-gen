@@ -12,7 +12,7 @@ def _pad8(name: str) -> bytes:
     return name.encode("ascii").ljust(8, b"\x00")[:8]
 
 
-def build_two_sector_wad() -> bytes:
+def _two_sector_core():
     """Two adjacent square sectors sharing one two-sided wall, one player
     start in sector 0, one monster in sector 1.
 
@@ -74,6 +74,11 @@ def build_two_sector_wad() -> bytes:
         (64, 64, 90, 1, 0x0007),     # Player1Start, all skills
         (192, 64, 0, 3004, 0x0007),  # Zombieman
     ]
+    return vertices, linedefs, sidedefs, sectors, things
+
+
+def build_two_sector_wad() -> bytes:
+    vertices, linedefs, sidedefs, sectors, things = _two_sector_core()
 
     things_data = b"".join(struct.pack("<hhhhH", *t) for t in things)
     linedefs_data = b"".join(struct.pack("<HHHHHHH", *l) for l in linedefs)
@@ -94,6 +99,60 @@ def build_two_sector_wad() -> bytes:
         ("SIDEDEFS", sidedefs_data),
         ("VERTEXES", vertexes_data),
         ("SECTORS", sectors_data),
+    ]
+    return _assemble_wad(lumps)
+
+
+def build_two_sector_wad_with_nodes() -> bytes:
+    """Same map as build_two_sector_wad(), plus hand-built SEGS/SSECTORS/
+    REJECT lumps consistent with the linedef/sidedef data, so the BSP
+    sanity-check derived-data pass has something real to cross-check against.
+    """
+    vertices, linedefs, sidedefs, sectors, things = _two_sector_core()
+
+    things_data = b"".join(struct.pack("<hhhhH", *t) for t in things)
+    linedefs_data = b"".join(struct.pack("<HHHHHHH", *l) for l in linedefs)
+    sidedefs_data = b"".join(
+        struct.pack("<hh", sd[0], sd[1]) + _pad8(sd[2]) + _pad8(sd[3]) + _pad8(sd[4]) + struct.pack("<H", sd[5])
+        for sd in sidedefs
+    )
+    vertexes_data = b"".join(struct.pack("<hh", *v) for v in vertices)
+    sectors_data = b"".join(
+        struct.pack("<hh", s[0], s[1]) + _pad8(s[2]) + _pad8(s[3]) + struct.pack("<hhh", s[4], s[5], s[6])
+        for s in sectors
+    )
+
+    # (v1, v2, angle, linedef_idx, direction, offset) - sector0's segs first,
+    # then sector1's, so SSECTORS below can reference contiguous ranges.
+    segs = [
+        (0, 1, 0, 0, 0, 0),   # linedef0 front (sector0)
+        (2, 3, 0, 2, 0, 0),   # linedef2 front (sector0)
+        (3, 0, 0, 3, 0, 0),   # linedef3 front (sector0)
+        (1, 2, 0, 1, 0, 0),   # linedef1 front = sector0 side
+        (1, 4, 0, 4, 0, 0),   # linedef4 front (sector1)
+        (4, 5, 0, 5, 0, 0),   # linedef5 front (sector1)
+        (5, 2, 0, 6, 0, 0),   # linedef6 front (sector1)
+        (2, 1, 0, 1, 1, 0),   # linedef1 back = sector1 side
+    ]
+    segs_data = b"".join(struct.pack("<hhhHhh", *s) for s in segs)
+
+    # (numsegs, firstseg)
+    ssectors = [(4, 0), (4, 4)]
+    ssectors_data = b"".join(struct.pack("<HH", *s) for s in ssectors)
+
+    reject_data = bytes([0])  # ceil(2*2/8) = 1 byte
+
+    lumps = [
+        ("MAP01", b""),
+        ("THINGS", things_data),
+        ("LINEDEFS", linedefs_data),
+        ("SIDEDEFS", sidedefs_data),
+        ("VERTEXES", vertexes_data),
+        ("SEGS", segs_data),
+        ("SSECTORS", ssectors_data),
+        ("NODES", b""),
+        ("SECTORS", sectors_data),
+        ("REJECT", reject_data),
     ]
     return _assemble_wad(lumps)
 

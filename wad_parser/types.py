@@ -65,8 +65,6 @@ class LinedefFlags:
     already_on_map: bool = False
     # Boom/MBF21 extensions
     pass_through: bool = False
-    translucent_25: bool = False
-    translucent_75: bool = False
     block_land_monsters: bool = False
     block_players: bool = False
 
@@ -82,6 +80,8 @@ class Linedef:
     right_sidedef: int
     left_sidedef: int  # -1 = one-sided
     args: Optional[list[int]] = None  # Hexen/UDMF action args
+    special_name: Optional[str] = None   # from LINEDEF_SPECIAL_TABLE, best-effort
+    trigger_type: Optional[str] = None   # walk/switch/push/gun/unknown/none
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -146,6 +146,15 @@ class Texture:
 
 
 @dataclass
+class FlatAsset:
+    name: str
+    width: Optional[int]   # None if not inferable (non-square, non-4096-byte)
+    height: Optional[int]
+    byte_length: int
+    sha256: str  # raw indexed-pixel bytes are written to a sidecar file named by this hash
+
+
+@dataclass
 class AnimatedEntry:
     kind: str  # "flat" or "texture"
     first: str
@@ -163,9 +172,11 @@ class SwitchEntry:
 @dataclass
 class TextureSet:
     textures: dict[str, Texture] = field(default_factory=dict)
-    flats: list[str] = field(default_factory=list)  # names only; raw pixels kept out of JSON
+    flats: list[FlatAsset] = field(default_factory=list)
     palette_count: int = 0
     colormap_count: int = 0
+    playpal_sha256: Optional[str] = None      # raw PLAYPAL bytes written to a sidecar file
+    colormap_sha256: Optional[str] = None     # raw COLORMAP bytes written to a sidecar file
     animated: list[AnimatedEntry] = field(default_factory=list)
     switches: list[SwitchEntry] = field(default_factory=list)
 
@@ -190,6 +201,7 @@ class MapMeta:
     source_wad: str
     wad_hash: str
     format: str  # "doom" | "hexen" | "udmf"
+    is_iwad: bool = False
     mapinfo: Optional[MapInfoEntry] = None
 
 
@@ -209,6 +221,15 @@ class DerivedData:
     reachable_from_start: list[int] = field(default_factory=list)
     texture_alignment_score: Optional[float] = None
     symmetry: Optional[dict[str, Any]] = None
+    # Re-centered/unit-scaled vertex coordinates, kept ALONGSIDE raw vertices
+    # (never instead of - absolute scale still matters, e.g. an 8/16/24 unit
+    # step is a stair, a 64-unit step is not climbable).
+    normalized_space: Optional[dict[str, Any]] = None
+    # Opportunistic cross-check of sector-polygon reconstruction against the
+    # map's own compiled BSP (SEGS/SSECTORS/REJECT), when present. Diagnostic
+    # only - never authoritative, and absent entirely for UDMF maps that ship
+    # ZNODES instead of classic nodes.
+    bsp_sanity_check: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -258,6 +279,7 @@ DOOMED_TABLE: dict[int, tuple[str, str]] = {
     2006: ("BFG9000", "weapon"),
     82: ("SuperShotgun", "weapon"),
     # Ammo
+    8: ("Backpack", "item"),
     2007: ("ClipAmmo", "ammo"),
     2008: ("ShellAmmo", "ammo"),
     2010: ("RocketAmmo", "ammo"),
@@ -380,7 +402,8 @@ def resolve_doomed(type_num: int) -> tuple[str, str, bool]:
 # Linedef special lookup
 # ---------------------------------------------------------------------------
 # (name, trigger_type) -- trigger_type is one of: walk, switch, push, shoot,
-# gun, cross (walk-over), manual, unknown
+# gun, cross (walk-over), manual, passive (a permanent line effect with no
+# activation, e.g. texture scrollers), unknown
 
 LINEDEF_SPECIAL_TABLE: dict[int, tuple[str, str]] = {
     0: ("None", "none"),
@@ -415,6 +438,7 @@ LINEDEF_SPECIAL_TABLE: dict[int, tuple[str, str]] = {
     36: ("Floor_LowerToHighestPlus8 (walk, once)", "walk"),
     38: ("Floor_LowerToLowest (walk, once, alt)", "walk"),
     40: ("Ceiling_RaiseToHighest (walk, once)", "walk"),
+    48: ("Scroll_Texture_Left", "passive"),
     42: ("Door_Close (switch, repeatable)", "switch"),
     46: ("Door_Open (gunfire, repeatable)", "gun"),
     52: ("Exit_Secret (walk, once)", "walk"),
@@ -451,4 +475,83 @@ def resolve_linedef_special(special_num: int) -> tuple[str, str]:
     entry = LINEDEF_SPECIAL_TABLE.get(special_num)
     if entry is None:
         return (f"Special_{special_num}", "unknown")
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Hexen/ZDoom action-special lookup
+# ---------------------------------------------------------------------------
+# Hexen format (and the "hexen"/"zdoom" UDMF namespaces) use a completely
+# different action-special numbering scheme from vanilla/Boom Doom - the same
+# number means something unrelated in each system, so this is intentionally
+# a separate table rather than a fallback into LINEDEF_SPECIAL_TABLE, which
+# would silently mislabel Hexen-format/ZDoom-namespace specials with the
+# wrong Doom-format name.
+
+HEXEN_SPECIAL_TABLE: dict[int, tuple[str, str]] = {
+    1: ("Polyobj_StartLine", "manual"),
+    2: ("Polyobj_RotateLeft", "manual"),
+    3: ("Polyobj_RotateRight", "manual"),
+    4: ("Polyobj_Move", "manual"),
+    5: ("Polyobj_ExplicitLine", "manual"),
+    6: ("Polyobj_MoveTimes8", "manual"),
+    7: ("Polyobj_DoorSwing", "manual"),
+    8: ("Polyobj_DoorSlide", "manual"),
+    10: ("Door_Close", "unknown"),
+    11: ("Door_Open", "unknown"),
+    12: ("Door_Raise", "unknown"),
+    13: ("Door_LockedRaise", "unknown"),
+    20: ("Floor_LowerByValue", "unknown"),
+    21: ("Floor_LowerToLowest", "unknown"),
+    22: ("Floor_LowerToNearest", "unknown"),
+    23: ("Floor_RaiseByValue", "unknown"),
+    24: ("Floor_RaiseToHighest", "unknown"),
+    25: ("Floor_RaiseToNearest", "unknown"),
+    26: ("Stairs_BuildDown", "unknown"),
+    27: ("Stairs_BuildUp", "unknown"),
+    28: ("Floor_RaiseAndCrush", "unknown"),
+    35: ("Floor_RaiseByValueTimes8", "unknown"),
+    36: ("Floor_LowerByValueTimes8", "unknown"),
+    40: ("Ceiling_LowerByValue", "unknown"),
+    41: ("Ceiling_RaiseByValue", "unknown"),
+    42: ("Ceiling_CrushAndRaise", "unknown"),
+    50: ("Plat_PerpetualRaise", "unknown"),
+    54: ("Plat_Stop", "unknown"),
+    56: ("Plat_DownWaitUpStayLip", "unknown"),
+    58: ("Plat_RaiseAndStay", "unknown"),
+    60: ("Light_ForceLightning", "unknown"),
+    61: ("Light_RaiseByValue", "unknown"),
+    62: ("Light_LowerByValue", "unknown"),
+    63: ("Light_ChangeToValue", "unknown"),
+    64: ("Light_Fade", "unknown"),
+    65: ("Light_Glow", "unknown"),
+    66: ("Light_Flicker", "unknown"),
+    67: ("Light_Strobe", "unknown"),
+    70: ("Radius_Quake", "unknown"),
+    71: ("Line_SetIdentification", "unknown"),
+    80: ("Thing_SpawnNoFog", "unknown"),
+    81: ("Teleport_NewMap", "unknown"),
+    82: ("Teleport_EndGame", "unknown"),
+    83: ("Teleport_Other", "unknown"),
+    84: ("Teleport_Group", "unknown"),
+    100: ("Door_LockedRaise (2)", "unknown"),
+    109: ("Line_SetBlocking", "unknown"),
+    121: ("Line_SetIdentification (2)", "unknown"),
+    129: ("ACS_Execute", "unknown"),
+    130: ("ACS_Suspend", "unknown"),
+    131: ("ACS_Terminate", "unknown"),
+    132: ("ACS_LockedExecute", "unknown"),
+    138: ("Light_StopFade", "unknown"),
+    139: ("Floor_Waggle", "unknown"),
+    140: ("Teleport_ZombieChanger", "unknown"),
+    141: ("Thrust_Thing", "unknown"),
+}
+
+HEXEN_UDMF_NAMESPACES = {"hexen", "zdoom", "zdoomtranslated", "vavoom"}
+
+
+def resolve_hexen_special(special_num: int) -> tuple[str, str]:
+    entry = HEXEN_SPECIAL_TABLE.get(special_num)
+    if entry is None:
+        return (f"HexenAction_{special_num}", "unknown")
     return entry

@@ -1,8 +1,10 @@
+import hashlib
 import struct
 
 from wad_parser.mapinfo_parser import parse_mapinfo
 from wad_parser.texture_parser import (
-    parse_animated, parse_pnames, parse_switches, parse_texture_lump,
+    build_flat_assets, build_texture_set, parse_animated, parse_pnames,
+    parse_switches, parse_texture_lump,
 )
 
 
@@ -63,6 +65,38 @@ def test_switches_lump():
     assert len(parsed) == 1
     assert parsed[0].off_texture == "SW1BRIK"
     assert parsed[0].on_texture == "SW2BRIK"
+
+
+def test_flat_assets_capture_dims_and_hash():
+    flat_bytes = {
+        "FLOOR4_8": b"\x07" * 4096,   # standard 64x64 flat
+        "BIGFLAT": b"\x03" * (128 * 128),  # non-standard but still square
+        "WEIRD": b"\x01" * 99,        # not a perfect square - dims unknown
+    }
+    assets = {a.name: a for a in build_flat_assets(flat_bytes)}
+
+    assert assets["FLOOR4_8"].width == 64 and assets["FLOOR4_8"].height == 64
+    assert assets["FLOOR4_8"].byte_length == 4096
+    assert assets["FLOOR4_8"].sha256 == hashlib.sha256(flat_bytes["FLOOR4_8"]).hexdigest()
+
+    assert assets["BIGFLAT"].width == 128 and assets["BIGFLAT"].height == 128
+
+    assert assets["WEIRD"].width is None and assets["WEIRD"].height is None
+    assert assets["WEIRD"].byte_length == 99
+
+
+def test_build_texture_set_hashes_playpal_and_colormap():
+    playpal = b"\x10" * 768  # 1 palette
+    colormap = b"\x20" * 256  # 1 colormap
+    ts = build_texture_set(
+        texture1=None, texture2=None, pnames_data=None,
+        flat_bytes={}, playpal=playpal, colormap=colormap,
+        animated=None, switches=None,
+    )
+    assert ts.palette_count == 1
+    assert ts.colormap_count == 1
+    assert ts.playpal_sha256 == hashlib.sha256(playpal).hexdigest()
+    assert ts.colormap_sha256 == hashlib.sha256(colormap).hexdigest()
 
 
 MAPINFO_SAMPLE = b"""

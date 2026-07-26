@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from wad_builder import build_two_sector_wad
+from wad_builder import build_two_sector_wad, build_two_sector_wad_with_nodes
 
 from wad_parser.map_extractor import extract_all_maps
 from wad_parser.wad_reader import WadFile
@@ -108,6 +108,56 @@ def test_bounds(tmp_path):
     assert doc.bounds.max_x == 256
     assert doc.bounds.min_y == 0
     assert doc.bounds.max_y == 128
+
+
+def test_linedef_special_name_resolved(tmp_path):
+    wad = WadFile(_write_wad(tmp_path))
+    doc = extract_all_maps(wad)[0]
+    # our synthetic map's linedefs are all special=0
+    assert doc.linedefs[0].special_name == "None"
+    assert doc.linedefs[0].trigger_type == "none"
+
+
+def test_meta_is_iwad_false_for_pwad(tmp_path):
+    wad = WadFile(_write_wad(tmp_path))
+    doc = extract_all_maps(wad)[0]
+    assert doc.meta.is_iwad is False
+
+
+def test_derived_normalized_space(tmp_path):
+    wad = WadFile(_write_wad(tmp_path))
+    doc = extract_all_maps(wad)[0]
+    norm = doc.derived.normalized_space
+    assert norm is not None
+    assert norm["center_x"] == 128
+    assert norm["center_y"] == 64
+    assert len(norm["vertices"]) == len(doc.vertices)
+    # every normalized coordinate should land within [-1, 1]
+    for x, y in norm["vertices"]:
+        assert -1.0 <= x <= 1.0
+        assert -1.0 <= y <= 1.0
+
+
+def test_derived_bsp_sanity_check_absent_without_nodes(tmp_path):
+    wad = WadFile(_write_wad(tmp_path))
+    doc = extract_all_maps(wad)[0]
+    assert doc.derived.bsp_sanity_check is None
+
+
+def test_derived_bsp_sanity_check_with_nodes(tmp_path):
+    p = tmp_path / "with_nodes.wad"
+    p.write_bytes(build_two_sector_wad_with_nodes())
+    wad = WadFile(str(p))
+    doc = extract_all_maps(wad)[0]
+    check = doc.derived.bsp_sanity_check
+    assert check is not None
+    assert check["subsector_count"] == 2
+    assert check["segs_total"] == 8
+    assert check["segs_covered_by_subsectors"] == 8
+    assert check["subsectors_contiguous"] is True
+    assert check["sectors_seen_in_bsp"] == 2
+    assert check["sectors_missing_from_reconstruction"] == []
+    assert check["reject_size_matches_expected"] is True
 
 
 def test_document_serializes_to_json(tmp_path):

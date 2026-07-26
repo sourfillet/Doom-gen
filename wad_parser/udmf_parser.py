@@ -16,7 +16,8 @@ from dataclasses import dataclass
 
 from wad_parser.types import (
     Linedef, LinedefFlags, Sector, SectorSlope, Sidedef, Thing, ThingFlags,
-    Vertex, resolve_doomed,
+    Vertex, resolve_doomed, resolve_hexen_special, resolve_linedef_special,
+    HEXEN_UDMF_NAMESPACES,
 )
 
 _TOKEN_RE = re.compile(r"""
@@ -215,6 +216,13 @@ def build_sidedefs(doc: UdmfDocument) -> list[Sidedef]:
 
 
 def build_linedefs(doc: UdmfDocument) -> list[Linedef]:
+    # The "special" field uses Hexen-style action-special numbering under the
+    # hexen/zdoom/vavoom namespaces, and vanilla/Boom numbering under "doom",
+    # "heretic", "strife", "eternity", etc. - resolving both through the same
+    # table would silently mislabel one or the other.
+    namespace = (doc.namespace or "").lower()
+    resolve_special = resolve_hexen_special if namespace in HEXEN_UDMF_NAMESPACES else resolve_linedef_special
+
     out = []
     for i, f in enumerate(doc.blocks.get("linedef", [])):
         flags = LinedefFlags()
@@ -222,15 +230,18 @@ def build_linedefs(doc: UdmfDocument) -> list[Linedef]:
             if f.get(udmf_key):
                 setattr(flags, attr, True)
         args = [f.get(f"arg{n}", 0) for n in range(5)] if any(f"arg{n}" in f for n in range(5)) else None
+        special = f.get("special", 0)
+        special_name, trigger_type = resolve_special(special)
         out.append(Linedef(
             id=i,
             v1=f.get("v1", 0), v2=f.get("v2", 0),
             flags=flags,
-            special=f.get("special", 0),
+            special=special,
             tag=f.get("id", 0),
             right_sidedef=f.get("sidefront", -1) if f.get("sidefront") is not None else -1,
             left_sidedef=f.get("sideback", -1) if f.get("sideback") is not None else -1,
             args=args,
+            special_name=special_name, trigger_type=trigger_type,
             extra=_split_extra(f, _KNOWN_LINEDEF_FIELDS),
         ))
     return out

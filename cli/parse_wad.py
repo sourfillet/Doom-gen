@@ -52,19 +52,41 @@ def main(wad_path: str, output_dir: str | None, map_name: str | None, to_stdout:
         dest.write_text(_to_json(doc))
         click.echo(f"wrote {dest}")
 
+    flat_bytes = wad.find_flats()
+    playpal = wad.get_lump("PLAYPAL")
+    colormap = wad.get_lump("COLORMAP")
+
     texture_set = build_texture_set(
         texture1=wad.get_lump("TEXTURE1"),
         texture2=wad.get_lump("TEXTURE2"),
         pnames_data=wad.get_lump("PNAMES"),
-        flat_names=wad.find_flat_names(),
-        playpal=wad.get_lump("PLAYPAL"),
-        colormap=wad.get_lump("COLORMAP"),
+        flat_bytes=flat_bytes,
+        playpal=playpal,
+        colormap=colormap,
         animated=wad.get_lump("ANIMATED"),
         switches=wad.get_lump("SWITCHES"),
     )
     tex_dest = out / f"{wad.hash}.textures.json"
     tex_dest.write_text(_to_json(texture_set))
     click.echo(f"wrote {tex_dest}")
+
+    # Raw pixel/palette/colormap bytes are kept out of the JSON (they're
+    # binary blobs, not structured fields) but still captured to disk,
+    # content-addressed by sha256 so repeated assets across WADs dedupe.
+    assets_dir = out / f"{wad.hash}_assets"
+    if flat_bytes:
+        flats_dir = assets_dir / "flats"
+        flats_dir.mkdir(parents=True, exist_ok=True)
+        for asset in texture_set.flats:
+            (flats_dir / f"{asset.sha256}.flat").write_bytes(flat_bytes[asset.name])
+    if playpal:
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        (assets_dir / f"{texture_set.playpal_sha256}.playpal").write_bytes(playpal)
+    if colormap:
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        (assets_dir / f"{texture_set.colormap_sha256}.colormap").write_bytes(colormap)
+    if flat_bytes or playpal or colormap:
+        click.echo(f"wrote raw assets under {assets_dir}")
 
 
 if __name__ == "__main__":

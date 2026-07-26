@@ -5,9 +5,11 @@ pairs are switches.
 """
 from __future__ import annotations
 
+import hashlib
+import math
 import struct
 
-from wad_parser.types import AnimatedEntry, Patch, SwitchEntry, Texture, TextureSet
+from wad_parser.types import AnimatedEntry, FlatAsset, Patch, SwitchEntry, Texture, TextureSet
 
 
 def _decode_name(raw: bytes) -> str:
@@ -82,11 +84,36 @@ def parse_switches(data: bytes) -> list[SwitchEntry]:
     return entries
 
 
+def _infer_flat_dims(size: int) -> tuple[int | None, int | None]:
+    if size == 4096:
+        return 64, 64  # the standard vanilla flat size
+    root = math.isqrt(size)
+    if root * root == size:
+        return root, root
+    return None, None
+
+
+def build_flat_assets(flat_bytes: dict[str, bytes]) -> list[FlatAsset]:
+    """One FlatAsset per flat, referencing (by sha256) the raw indexed-pixel
+    bytes a caller is expected to persist to a sidecar file - see
+    plan/data-model.md: flats are captured with their raw pixels, not just
+    their name.
+    """
+    assets = []
+    for name, data in flat_bytes.items():
+        width, height = _infer_flat_dims(len(data))
+        assets.append(FlatAsset(
+            name=name, width=width, height=height,
+            byte_length=len(data), sha256=hashlib.sha256(data).hexdigest(),
+        ))
+    return assets
+
+
 def build_texture_set(
     texture1: bytes | None,
     texture2: bytes | None,
     pnames_data: bytes | None,
-    flat_names: list[str],
+    flat_bytes: dict[str, bytes],
     playpal: bytes | None,
     colormap: bytes | None,
     animated: bytes | None,
@@ -100,9 +127,11 @@ def build_texture_set(
         textures.update(parse_texture_lump(texture2, pnames))
     return TextureSet(
         textures=textures,
-        flats=flat_names,
+        flats=build_flat_assets(flat_bytes),
         palette_count=(len(playpal) // 768) if playpal else 0,
         colormap_count=(len(colormap) // 256) if colormap else 0,
+        playpal_sha256=hashlib.sha256(playpal).hexdigest() if playpal else None,
+        colormap_sha256=hashlib.sha256(colormap).hexdigest() if colormap else None,
         animated=parse_animated(animated) if animated else [],
         switches=parse_switches(switches) if switches else [],
     )

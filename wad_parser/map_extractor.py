@@ -10,6 +10,7 @@ without re-reading the source WAD.
 from __future__ import annotations
 
 import math
+import struct
 from collections import defaultdict, deque
 
 from wad_parser import lump_parser, udmf_parser
@@ -82,8 +83,49 @@ def _sector_adjacency(sectors, linedefs, sidedefs) -> dict:
         a = sidedefs[ld.right_sidedef].sector
         b = sidedefs[ld.left_sidedef].sector
         if a != b:
-            edges.append({"a": a, "b": b, "linedef": ld.id})
+            edges.append({"a": a, "b": b, "linedef": ld.id, "kind": "walk"})
     return {"nodes": [s.id for s in sectors], "edges": edges}
+
+
+# Linedef specials that teleport the player: vanilla W1/WR (any-thing and
+# monster-only) plus the Boom W1/WR silent-teleport variants. Without these,
+# reachability analysis treats every teleporter-linked area as disconnected
+# geometry, which is wrong - teleporters are normal, common map design, not
+# a defect - so they get their own edge kind rather than being folded into
+# (or omitted from) the walk-adjacency graph.
+_TELEPORT_SPECIALS = {39, 97, 125, 126, 207, 208, 209, 210, 243, 244}
+
+
+def _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices) -> list[dict]:
+    if not any(ld.special in _TELEPORT_SPECIALS for ld in linedefs):
+        return []
+    dest_by_sector: list[tuple[int, int]] = []  # (sector_id, sector_tag)
+    tag_by_sector = {s.id: s.tag for s in sectors}
+    for t in things:
+        if t.category != "teleport-dest":
+            continue
+        sec = _sector_containing(t.x, t.y, sectors, polygons, vertices)
+        if sec is not None:
+            dest_by_sector.append((sec, tag_by_sector.get(sec, 0)))
+    if not dest_by_sector:
+        return []
+
+    edges = []
+    for ld in linedefs:
+        if ld.special not in _TELEPORT_SPECIALS:
+            continue
+        if ld.right_sidedef == -1 or ld.right_sidedef >= len(sidedefs):
+            continue
+        src_sector = sidedefs[ld.right_sidedef].sector
+        # Tagged teleporters (Boom/Hexen) target only destinations in a
+        # same-tagged sector; untagged (vanilla) teleporters aren't
+        # disambiguated by the game either, so connect to every destination.
+        candidates = [s for s, tag in dest_by_sector if ld.tag and tag == ld.tag] if ld.tag else \
+            [s for s, _ in dest_by_sector]
+        for dest_sector in candidates:
+            if dest_sector != src_sector:
+                edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id, "kind": "teleport"})
+    return edges
 
 
 def _trigger_map(sectors, linedefs) -> dict[str, list[int]]:
@@ -185,6 +227,78 @@ def _texture_alignment_score(sectors, linedefs, sidedefs, polygons) -> float | N
     return (matches / total) if total else None
 
 
+def _normalized_space(vertices, bounds: BoundingBox) -> dict | None:
+    """Re-centered, unit-scaled vertex coordinates, kept alongside (not
+    instead of) the raw vertex list - see plan/data-model.md.
+    """
+    if not vertices:
+        return None
+    center_x = (bounds.min_x + bounds.max_x) / 2
+    center_y = (bounds.min_y + bounds.max_y) / 2
+    half_w = (bounds.max_x - bounds.min_x) / 2
+    half_h = (bounds.max_y - bounds.min_y) / 2
+    scale = 1.0 / max(half_w, half_h, 1e-6)
+    return {
+        "center_x": center_x,
+        "center_y": center_y,
+        "scale": scale,
+        "vertices": [[(v.x - center_x) * scale, (v.y - center_y) * scale] for v in vertices],
+    }
+
+
+def _bsp_sanity_check(group: MapLumpGroup, linedefs, sidedefs, sectors, polygons) -> dict | None:
+    """Opportunistic cross-check against the map's own compiled BSP, per
+    plan/data-model.md: SEGS/SSECTORS/NODES/REJECT aren't stored as training
+    data (they're artifacts of a node-builder's internal choices, not
+    authored map content), but reading them lets us flag a sector-polygon
+    reconstruction bug rather than silently shipping bad derived data.
+    Only meaningful for classic binary nodes; UDMF maps typically ship
+    ZNODES instead, so this returns None for those.
+    """
+    segs_data = group.lumps.get("SEGS")
+    ssectors_data = group.lumps.get("SSECTORS")
+    reject_data = group.lumps.get("REJECT")
+    if not segs_data or not ssectors_data:
+        return None
+
+    n_segs = len(segs_data) // 12
+    bsp_sectors: set[int] = set()
+    for i in range(n_segs):
+        off = i * 12
+        _v1, _v2, _angle, linedef_idx, direction, _offset = struct.unpack_from("<hhhHhh", segs_data, off)
+        if linedef_idx == 0xFFFF or linedef_idx >= len(linedefs):
+            continue  # miniseg: BSP partition artifact, not a real wall
+        ld = linedefs[linedef_idx]
+        sd_id = ld.left_sidedef if direction == 1 else ld.right_sidedef
+        if sd_id is not None and sd_id != -1 and sd_id < len(sidedefs):
+            bsp_sectors.add(sidedefs[sd_id].sector)
+
+    n_ssectors = len(ssectors_data) // 4
+    covered, prev_end, contiguous = 0, 0, True
+    for i in range(n_ssectors):
+        off = i * 4
+        numsegs, firstseg = struct.unpack_from("<HH", ssectors_data, off)
+        if firstseg != prev_end:
+            contiguous = False
+        prev_end = firstseg + numsegs
+        covered += numsegs
+
+    sectors_with_geometry = {i for i, ring in enumerate(polygons) if ring}
+    result = {
+        "subsector_count": n_ssectors,
+        "segs_total": n_segs,
+        "segs_covered_by_subsectors": covered,
+        "subsectors_contiguous": contiguous,
+        "sectors_seen_in_bsp": len(bsp_sectors),
+        "sectors_missing_from_reconstruction": sorted(bsp_sectors - sectors_with_geometry),
+    }
+    if reject_data is not None:
+        expected = (len(sectors) * len(sectors) + 7) // 8
+        result["reject_size_bytes"] = len(reject_data)
+        result["reject_size_matches_expected"] = len(reject_data) == expected
+    return result
+
+
 def _detect_symmetry(vertices, bounds: BoundingBox) -> dict | None:
     if not vertices:
         return None
@@ -234,11 +348,14 @@ def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) 
 
     polygons = _sector_polygons(sectors, linedefs, sidedefs)
     adjacency = _sector_adjacency(sectors, linedefs, sidedefs)
+    adjacency["edges"] += _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices)
     triggers = _trigger_map(sectors, linedefs)
     reachable = _reachable_from_start(sectors, things, polygons, vertices, adjacency)
     alignment = _texture_alignment_score(sectors, linedefs, sidedefs, polygons)
     bounds = _bounds(vertices)
     symmetry = _detect_symmetry(vertices, bounds)
+    normalized = _normalized_space(vertices, bounds)
+    bsp_check = _bsp_sanity_check(group, linedefs, sidedefs, sectors, polygons)
 
     entry = (mapinfo or {}).get(group.name)
 
@@ -247,6 +364,7 @@ def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) 
         source_wad=wad.path,
         wad_hash=wad.hash,
         format=group.format,
+        is_iwad=(wad.identification == "IWAD"),
         mapinfo=entry,
     )
     derived = DerivedData(
@@ -256,6 +374,8 @@ def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) 
         reachable_from_start=reachable,
         texture_alignment_score=alignment,
         symmetry=symmetry,
+        normalized_space=normalized,
+        bsp_sanity_check=bsp_check,
     )
     return MapDocument(
         schema_version=SCHEMA_VERSION,
