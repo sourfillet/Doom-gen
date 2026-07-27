@@ -8,6 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.0",
+    "numpy>=1.24",
 ]
 
 [project.optional-dependencies]
@@ -15,11 +16,16 @@ dev = [
     "pytest>=7.0",
     "pytest-cov",
 ]
+ml = [
+    "torch>=2.2",
+]
 
 [project.scripts]
 parse-wad = "cli.parse_wad:main"
 tag-maps = "cli.tag_maps:main"
+train-layout = "cli.train_layout:main"
+generate-wad = "cli.generate_wad:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["wad_parser*", "cli*", "tagging*"]
+include = ["wad_parser*", "cli*", "tagging*", "data*", "models*", "generation*", "wad_writer*"]

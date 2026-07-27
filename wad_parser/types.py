@@ -8,7 +8,7 @@ already-parsed documents.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from typing import Any, Optional
 
 SCHEMA_VERSION = "1.0"
@@ -261,6 +261,52 @@ class MapDocument:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MapDocument":
+        """Rebuilds a MapDocument from its to_dict()/JSON form. Unknown keys
+        are dropped rather than erroring, so documents written by a NEWER
+        schema still load (the reverse of the extra-bag guarantee)."""
+        meta_d = dict(data["meta"])
+        mapinfo = meta_d.get("mapinfo")
+        meta_d["mapinfo"] = _build(MapInfoEntry, mapinfo) if mapinfo else None
+        return cls(
+            schema_version=data["schema_version"],
+            meta=_build(MapMeta, meta_d),
+            bounds=_build(BoundingBox, data["bounds"]),
+            vertices=[_build(Vertex, v) for v in data["vertices"]],
+            sectors=[_build_sector(s) for s in data["sectors"]],
+            linedefs=[_build_linedef(l) for l in data["linedefs"]],
+            sidedefs=[_build(Sidedef, s) for s in data["sidedefs"]],
+            things=[_build_thing(t) for t in data["things"]],
+            derived=_build(DerivedData, data["derived"]),
+            extra=data.get("extra", {}),
+        )
+
+
+def _build(cls, d: dict):
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in d.items() if k in known})
+
+
+def _build_sector(d: dict) -> Sector:
+    d = dict(d)
+    for key in ("floor_slope", "ceil_slope"):
+        if d.get(key):
+            d[key] = _build(SectorSlope, d[key])
+    return _build(Sector, d)
+
+
+def _build_linedef(d: dict) -> Linedef:
+    d = dict(d)
+    d["flags"] = _build(LinedefFlags, d["flags"])
+    return _build(Linedef, d)
+
+
+def _build_thing(d: dict) -> Thing:
+    d = dict(d)
+    d["flags"] = _build(ThingFlags, d["flags"])
+    return _build(Thing, d)
 
 
 # ---------------------------------------------------------------------------

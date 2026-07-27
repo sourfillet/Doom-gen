@@ -417,6 +417,38 @@ def _parse_udmf_group(group: MapLumpGroup):
     return vertices, sectors, linedefs, sidedefs, things, doc
 
 
+def compute_derived(vertices, sectors, linedefs, sidedefs, things,
+                    hexen_style: bool = False,
+                    group: MapLumpGroup | None = None) -> tuple[BoundingBox, DerivedData]:
+    """The full derived-layer pass, callable on any raw element set - used
+    by extract_map and by data/augmentation.py to recompute derived data
+    after a geometric transform (derived data is never transformed in
+    place; it is always a pure function of the raw layer). The BSP
+    sanity-check needs the original lump group and is skipped without one.
+    """
+    polygons = _sector_polygons(sectors, linedefs, sidedefs)
+    adjacency = _sector_adjacency(sectors, linedefs, sidedefs)
+    adjacency["edges"] += _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices,
+                                          hexen_style=hexen_style)
+    triggers = _trigger_map(sectors, linedefs, hexen_style=hexen_style)
+    reachable = _reachable_from_start(sectors, things, polygons, vertices, adjacency)
+    alignment = _texture_alignment_score(sectors, linedefs, sidedefs, polygons)
+    bounds = _bounds(vertices)
+    derived = DerivedData(
+        sector_graph=adjacency,
+        sector_polygons=polygons,
+        trigger_map=triggers,
+        reachable_from_start=reachable,
+        texture_alignment_score=alignment,
+        symmetry=_detect_symmetry(vertices, bounds),
+        normalized_space=_normalized_space(vertices, bounds),
+        bsp_sanity_check=(
+            _bsp_sanity_check(group, linedefs, sidedefs, sectors, polygons) if group else None
+        ),
+    )
+    return bounds, derived
+
+
 def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) -> MapDocument:
     doc_extra: dict = {}
     if group.format == "udmf":
@@ -428,17 +460,8 @@ def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) 
         vertices, sectors, linedefs, sidedefs, things = _parse_binary_group(group)
         hexen_style = group.format == "hexen"
 
-    polygons = _sector_polygons(sectors, linedefs, sidedefs)
-    adjacency = _sector_adjacency(sectors, linedefs, sidedefs)
-    adjacency["edges"] += _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices,
-                                          hexen_style=hexen_style)
-    triggers = _trigger_map(sectors, linedefs, hexen_style=hexen_style)
-    reachable = _reachable_from_start(sectors, things, polygons, vertices, adjacency)
-    alignment = _texture_alignment_score(sectors, linedefs, sidedefs, polygons)
-    bounds = _bounds(vertices)
-    symmetry = _detect_symmetry(vertices, bounds)
-    normalized = _normalized_space(vertices, bounds)
-    bsp_check = _bsp_sanity_check(group, linedefs, sidedefs, sectors, polygons)
+    bounds, derived = compute_derived(vertices, sectors, linedefs, sidedefs, things,
+                                      hexen_style=hexen_style, group=group)
 
     entry = (mapinfo or {}).get(group.name)
 
@@ -449,16 +472,6 @@ def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) 
         format=group.format,
         is_iwad=(wad.identification == "IWAD"),
         mapinfo=entry,
-    )
-    derived = DerivedData(
-        sector_graph=adjacency,
-        sector_polygons=polygons,
-        trigger_map=triggers,
-        reachable_from_start=reachable,
-        texture_alignment_score=alignment,
-        symmetry=symmetry,
-        normalized_space=normalized,
-        bsp_sanity_check=bsp_check,
     )
     return MapDocument(
         schema_version=SCHEMA_VERSION,
