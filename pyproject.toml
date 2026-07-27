@@ -18,7 +18,8 @@ dev = [
 
 [project.scripts]
 parse-wad = "cli.parse_wad:main"
+tag-maps = "cli.tag_maps:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["wad_parser*", "cli*"]
+include = ["wad_parser*", "cli*", "tagging*"]

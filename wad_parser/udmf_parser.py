@@ -134,12 +134,29 @@ _LINEDEF_FLAG_FIELDS = {
     "mapped": "already_on_map",
     "passuse": "pass_through",
     "blockplayers": "block_players",
+    "repeatspecial": "repeat_special",
+    "monsteractivate": "monsters_can_activate",
+    "blockeverything": "block_everything",
 }
+
+# UDMF activation fields (hexen/zdoom namespaces) -> trigger_type, in
+# priority order for lines that set more than one.
+_LINEDEF_ACTIVATION_FIELDS = [
+    ("playeruse", "switch"),
+    ("playercross", "walk"),
+    ("playerpush", "push"),
+    ("impact", "gun"),
+    ("missilecross", "projectile-walk"),
+    ("monstercross", "monster-walk"),
+    ("monsteruse", "monster-switch"),
+    ("monsterpush", "monster-push"),
+]
 
 _KNOWN_VERTEX_FIELDS = {"x", "y", "zfloor", "zceiling"}
 _KNOWN_LINEDEF_FIELDS = {
     "v1", "v2", "sidefront", "sideback", "special", "id",
     *_LINEDEF_FLAG_FIELDS.keys(),
+    *(name for name, _ in _LINEDEF_ACTIVATION_FIELDS),
     *(f"arg{i}" for i in range(5)),
 }
 _KNOWN_SIDEDEF_FIELDS = {"offsetx", "offsety", "texturetop", "texturebottom", "texturemiddle", "sector"}
@@ -149,9 +166,12 @@ _KNOWN_SECTOR_FIELDS = {
     "floorplane_a", "floorplane_b", "floorplane_c", "floorplane_d",
     "ceilingplane_a", "ceilingplane_b", "ceilingplane_c", "ceilingplane_d",
 }
+# skill1..skill5 are deliberately NOT consumed into known fields: ThingFlags
+# folds them into the coarse skill_1_2/skill_3/skill_4_5 triple, which loses
+# the skill1-vs-2 / skill4-vs-5 distinction, so the raw fields stay in
+# `extra` for lossless capture.
 _KNOWN_THING_FIELDS = {
     "x", "y", "height", "angle", "type", "id", "special",
-    "skill1", "skill2", "skill3", "skill4", "skill5",
     "ambush", "single", "dm", "coop", "friend",
     *(f"arg{i}" for i in range(5)),
 }
@@ -164,13 +184,13 @@ def _split_extra(fields: dict, known: set[str]) -> dict:
 def build_vertices(doc: UdmfDocument) -> list[Vertex]:
     out = []
     for i, f in enumerate(doc.blocks.get("vertex", [])):
-        zfloor = f.get("zfloor")
-        zceiling = f.get("zceiling")
-        z = zfloor if zfloor is not None else zceiling
+        # z holds the floor height only; a ceiling-height offset always goes
+        # to extra["zceiling"] so it is never mislabeled as a floor value.
         extra = _split_extra(f, _KNOWN_VERTEX_FIELDS)
-        if zfloor is not None and zceiling is not None:
-            extra["zceiling"] = zceiling
-        out.append(Vertex(id=i, x=f.get("x", 0.0), y=f.get("y", 0.0), z=z, extra=extra))
+        if f.get("zceiling") is not None:
+            extra["zceiling"] = f["zceiling"]
+        out.append(Vertex(id=i, x=f.get("x", 0.0), y=f.get("y", 0.0),
+                          z=f.get("zfloor"), extra=extra))
     return out
 
 
@@ -211,6 +231,7 @@ def build_sidedefs(doc: UdmfDocument) -> list[Sidedef]:
             lower_tex=f.get("texturebottom", "-"),
             mid_tex=f.get("texturemiddle", "-"),
             sector=f.get("sector", 0),
+            extra=_split_extra(f, _KNOWN_SIDEDEF_FIELDS),
         ))
     return out
 
@@ -219,9 +240,13 @@ def build_linedefs(doc: UdmfDocument) -> list[Linedef]:
     # The "special" field uses Hexen-style action-special numbering under the
     # hexen/zdoom/vavoom namespaces, and vanilla/Boom numbering under "doom",
     # "heretic", "strife", "eternity", etc. - resolving both through the same
-    # table would silently mislabel one or the other.
+    # table would silently mislabel one or the other. Under the Hexen-style
+    # namespaces the activation also lives outside the special number, in
+    # per-line boolean fields (playeruse/playercross/...), so trigger_type
+    # comes from those there.
     namespace = (doc.namespace or "").lower()
-    resolve_special = resolve_hexen_special if namespace in HEXEN_UDMF_NAMESPACES else resolve_linedef_special
+    is_hexen_ns = namespace in HEXEN_UDMF_NAMESPACES
+    resolve_special = resolve_hexen_special if is_hexen_ns else resolve_linedef_special
 
     out = []
     for i, f in enumerate(doc.blocks.get("linedef", [])):
@@ -232,6 +257,14 @@ def build_linedefs(doc: UdmfDocument) -> list[Linedef]:
         args = [f.get(f"arg{n}", 0) for n in range(5)] if any(f"arg{n}" in f for n in range(5)) else None
         special = f.get("special", 0)
         special_name, trigger_type = resolve_special(special)
+        if is_hexen_ns:
+            if special == 0:
+                trigger_type = "none"
+            else:
+                trigger_type = next(
+                    (ttype for fname, ttype in _LINEDEF_ACTIVATION_FIELDS if f.get(fname)),
+                    "unknown",
+                )
         out.append(Linedef(
             id=i,
             v1=f.get("v1", 0), v2=f.get("v2", 0),
@@ -250,14 +283,17 @@ def build_linedefs(doc: UdmfDocument) -> list[Linedef]:
 def build_things(doc: UdmfDocument) -> list[Thing]:
     out = []
     for i, f in enumerate(doc.blocks.get("thing", [])):
+        # Per the UDMF spec every boolean field defaults to false, including
+        # single/dm/coop - an absent mode flag means the thing does NOT
+        # appear in that mode, hence the strict not-form below.
         flags = ThingFlags(
             skill_1_2=bool(f.get("skill1") or f.get("skill2")),
             skill_3=bool(f.get("skill3")),
             skill_4_5=bool(f.get("skill4") or f.get("skill5")),
             deaf=bool(f.get("ambush")),
-            not_single_player=("single" in f and not f["single"]),
-            not_deathmatch=("dm" in f and not f["dm"]),
-            not_coop=("coop" in f and not f["coop"]),
+            not_single_player=not f.get("single", False),
+            not_deathmatch=not f.get("dm", False),
+            not_coop=not f.get("coop", False),
             friendly=bool(f.get("friend")),
         )
         type_num = f.get("type", 0)

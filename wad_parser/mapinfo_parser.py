@@ -22,6 +22,7 @@ _FIELD_MAP = {
     "levelname": "level_name",
     "music": "music",
     "sky1": "sky",
+    "skytexture": "sky",  # UMAPINFO's name for it
     "cluster": "cluster",
     "next": "next_map",
 }

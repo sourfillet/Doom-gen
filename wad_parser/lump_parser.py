@@ -109,6 +109,49 @@ def parse_linedefs_doom(data: bytes) -> list:
     return out
 
 
+# Hexen redefines the linedef flag word above bit 8 (doomwiki.org "Linedef",
+# Hexen level format): 0x0200 is ML_REPEAT_SPECIAL (not Boom's pass-through),
+# bits 10-12 (0x1C00) are the SPAC activation field, and 0x2000/0x8000 are
+# ZDoom-in-Hexen extensions. Bits 0-8 match Doom.
+_HEXEN_EXTRA_FLAG_BITS: list[tuple[int, str]] = [
+    (0x0200, "repeat_special"),
+    (0x2000, "monsters_can_activate"),  # ZDoom
+    (0x8000, "block_everything"),        # ZDoom
+]
+_HEXEN_SPAC_MASK = 0x1C00
+_HEXEN_SPAC_SHIFT = 10
+# SPAC value -> trigger_type. 6 (use w/ pass-through) is ZDoom-only.
+_SPAC_TRIGGER = {
+    0: "walk",             # crossed by player
+    1: "switch",           # used by player
+    2: "monster-walk",     # crossed by monster
+    3: "gun",              # projectile impact
+    4: "push",             # player bumps
+    5: "projectile-walk",  # crossed by projectile
+    6: "switch",           # used by player, pass-through (ZDoom)
+}
+_KNOWN_HEXEN_LINEDEF_MASK = 0x01FF | _HEXEN_SPAC_MASK
+for _bit, _ in _HEXEN_EXTRA_FLAG_BITS:
+    _KNOWN_HEXEN_LINEDEF_MASK |= _bit
+
+
+def _decode_linedef_flags_hexen(raw: int) -> tuple[LinedefFlags, dict, str]:
+    flags = LinedefFlags()
+    for bit, attr in _LINEDEF_FLAG_BITS:
+        if bit <= 0x0100 and raw & bit:  # Doom-shared low bits only
+            setattr(flags, attr, True)
+    for bit, attr in _HEXEN_EXTRA_FLAG_BITS:
+        if raw & bit:
+            setattr(flags, attr, True)
+    spac = (raw & _HEXEN_SPAC_MASK) >> _HEXEN_SPAC_SHIFT
+    trigger_type = _SPAC_TRIGGER.get(spac, "unknown")
+    if spac == 6:
+        flags.pass_through = True
+    leftover = raw & ~_KNOWN_HEXEN_LINEDEF_MASK
+    extra = {"unrecognized_flag_bits": leftover} if leftover else {}
+    return flags, extra, trigger_type
+
+
 def parse_linedefs_hexen(data: bytes) -> list:
     from wad_parser.types import Linedef
     count = len(data) // 16
@@ -119,8 +162,10 @@ def parse_linedefs_hexen(data: bytes) -> list:
         special = data[off + 6]
         args = list(data[off + 7: off + 12])
         right, left = struct.unpack_from("<HH", data, off + 12)
-        flags, extra = _decode_linedef_flags(raw_flags)
-        special_name, trigger_type = resolve_hexen_special(special)
+        flags, extra, trigger_type = _decode_linedef_flags_hexen(raw_flags)
+        special_name, _ = resolve_hexen_special(special)
+        if special == 0:
+            trigger_type = "none"
         out.append(Linedef(
             id=i, v1=v1, v2=v2, flags=flags, special=special, tag=0,
             right_sidedef=right if right != 0xFFFF else -1,
@@ -173,6 +218,39 @@ def parse_things_doom(data: bytes) -> list[Thing]:
     return out
 
 
+# Hexen thing flags (doomwiki.org "Thing", Hexen format): skills and ambush
+# match Doom, but 0x0010 is dormant (not "not in single player"), 0x0020-
+# 0x0080 are class-presence bits, and 0x0100-0x0400 are POSITIVE mode-
+# presence bits (set = appears in that mode) - the reverse sense of Doom's
+# not_* flags, so they are inverted here to keep ThingFlags semantics
+# uniform across formats.
+_HEXEN_THING_FLAG_BITS: list[tuple[int, str]] = [
+    (0x0001, "skill_1_2"),
+    (0x0002, "skill_3"),
+    (0x0004, "skill_4_5"),
+    (0x0008, "deaf"),
+    (0x0010, "dormant"),
+    (0x0020, "class_fighter"),
+    (0x0040, "class_cleric"),
+    (0x0080, "class_mage"),
+]
+_HEXEN_MODE_BITS = [(0x0100, "not_single_player"), (0x0200, "not_coop"), (0x0400, "not_deathmatch")]
+_KNOWN_HEXEN_THING_MASK = 0x07FF
+
+
+def _decode_thing_flags_hexen(raw: int) -> tuple[ThingFlags, dict]:
+    flags = ThingFlags()
+    for bit, attr in _HEXEN_THING_FLAG_BITS:
+        if raw & bit:
+            setattr(flags, attr, True)
+    for bit, attr in _HEXEN_MODE_BITS:
+        if not raw & bit:
+            setattr(flags, attr, True)
+    leftover = raw & ~_KNOWN_HEXEN_THING_MASK
+    extra = {"unrecognized_flag_bits": leftover} if leftover else {}
+    return flags, extra
+
+
 def parse_things_hexen(data: bytes) -> list[Thing]:
     count = len(data) // 20
     out = []
@@ -181,7 +259,7 @@ def parse_things_hexen(data: bytes) -> list[Thing]:
         tid, x, y, z, angle, type_num, raw_flags = struct.unpack_from("<hhhhhhH", data, off)
         special = data[off + 14]
         args = list(data[off + 15: off + 20])
-        flags, extra = _decode_thing_flags(raw_flags)
+        flags, extra = _decode_thing_flags_hexen(raw_flags)
         name, category, unresolved = resolve_doomed(type_num)
         out.append(Thing(
             id=i, x=x, y=y, z=z, angle=angle, type=type_num,

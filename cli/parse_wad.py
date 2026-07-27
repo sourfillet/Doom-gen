@@ -37,21 +37,6 @@ def main(wad_path: str, output_dir: str | None, map_name: str | None, to_stdout:
         if not maps:
             raise click.ClickException(f"Map {map_name!r} not found in {wad_path}")
 
-    if to_stdout:
-        for doc in maps:
-            click.echo(_to_json(doc))
-        return
-
-    if not output_dir:
-        raise click.ClickException("Specify --output <dir> or --stdout")
-
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    for doc in maps:
-        dest = out / f"{doc.meta.map_name}.json"
-        dest.write_text(_to_json(doc))
-        click.echo(f"wrote {dest}")
-
     flat_bytes = wad.find_flats()
     playpal = wad.get_lump("PLAYPAL")
     colormap = wad.get_lump("COLORMAP")
@@ -66,6 +51,23 @@ def main(wad_path: str, output_dir: str | None, map_name: str | None, to_stdout:
         animated=wad.get_lump("ANIMATED"),
         switches=wad.get_lump("SWITCHES"),
     )
+
+    if to_stdout:
+        for doc in maps:
+            click.echo(_to_json(doc))
+        if not map_name:  # WAD-wide document; skip when filtering to one map
+            click.echo(_to_json(texture_set))
+        return
+
+    if not output_dir:
+        raise click.ClickException("Specify --output <dir> or --stdout")
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    for doc in maps:
+        dest = out / f"{doc.meta.map_name}.json"
+        dest.write_text(_to_json(doc))
+        click.echo(f"wrote {dest}")
     tex_dest = out / f"{wad.hash}.textures.json"
     tex_dest.write_text(_to_json(texture_set))
     click.echo(f"wrote {tex_dest}")

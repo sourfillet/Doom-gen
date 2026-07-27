@@ -8,7 +8,7 @@ import re
 import struct
 from dataclasses import dataclass
 
-MAP_MARKER_RE = re.compile(r"^(MAP\d{2}|E\d[MT]\d)$")
+MAP_MARKER_RE = re.compile(r"^(MAP\d{2,3}|E\d[MT]\d\d?)$")
 
 # Lumps that appear directly after a map marker, in the binary (Doom/Hexen) format.
 BINARY_MAP_LUMPS = {
@@ -16,10 +16,8 @@ BINARY_MAP_LUMPS = {
     "SSECTORS", "NODES", "SECTORS", "REJECT", "BLOCKMAP",
     "BEHAVIOR", "SCRIPTS",
 }
-# Lumps that appear directly after a map marker, in UDMF format.
-UDMF_MAP_LUMPS = {"TEXTMAP", "ZNODES", "DIALOGUE", "ENDMAP", "BLOCKMAP", "REJECT"}
-
-ALL_MAP_LUMPS = BINARY_MAP_LUMPS | UDMF_MAP_LUMPS
+# UDMF needs no lump whitelist: everything between a TEXTMAP and its ENDMAP
+# belongs to the map regardless of name (see find_map_groups).
 
 FLAT_MARKERS = [("F_START", "F_END"), ("FF_START", "FF_END")]
 
@@ -63,9 +61,18 @@ class WadFile:
         self.lumps: list[LumpEntry] = []
         for i in range(numlumps):
             entry_off = infotableofs + i * 16
+            if entry_off + 16 > len(data):
+                raise ValueError(f"{self.path}: lump directory extends past end of file")
             filepos, size = struct.unpack_from("<ii", data, entry_off)
             raw_name = data[entry_off + 8: entry_off + 16]
             name = raw_name.split(b"\x00", 1)[0].decode("ascii", errors="replace").upper()
+            # A negative filepos would silently slice from the END of the
+            # buffer in Python; treat any out-of-bounds entry as corrupt.
+            if size > 0 and (filepos < 0 or size < 0 or filepos + size > len(data)):
+                raise ValueError(
+                    f"{self.path}: lump {name!r} points outside the file "
+                    f"(filepos={filepos}, size={size})"
+                )
             lump_data = data[filepos: filepos + size] if size > 0 else b""
             self.lumps.append(LumpEntry(name=name, data=lump_data))
 
@@ -76,24 +83,32 @@ class WadFile:
         """Walk the lump directory and group consecutive lumps following a
         map marker into one MapLumpGroup, detecting binary vs. UDMF format
         and Doom vs. Hexen binary sub-format (BEHAVIOR lump present).
+
+        UDMF's rule differs from the binary formats: ANY lump immediately
+        followed by TEXTMAP is a map marker (the marker name is free-form),
+        and EVERY lump up to the closing ENDMAP belongs to the map, whatever
+        its name - custom lumps in the block are preserved, not dropped.
         """
         groups: list[MapLumpGroup] = []
         i = 0
         n = len(self.lumps)
         while i < n:
             name = self.lumps[i].name
-            if MAP_MARKER_RE.match(name) and i + 1 < n and self.lumps[i + 1].name in ALL_MAP_LUMPS:
+            if i + 1 < n and self.lumps[i + 1].name == "TEXTMAP":
                 j = i + 1
                 collected: dict[str, bytes] = {}
-                while j < n and self.lumps[j].name in ALL_MAP_LUMPS:
+                while j < n and self.lumps[j].name != "ENDMAP":
                     collected[self.lumps[j].name] = self.lumps[j].data
                     j += 1
-                if "TEXTMAP" in collected:
-                    fmt = "udmf"
-                elif "BEHAVIOR" in collected:
-                    fmt = "hexen"
-                else:
-                    fmt = "doom"
+                groups.append(MapLumpGroup(name=name, format="udmf", lumps=collected))
+                i = j + 1
+            elif MAP_MARKER_RE.match(name) and i + 1 < n and self.lumps[i + 1].name in BINARY_MAP_LUMPS:
+                j = i + 1
+                collected = {}
+                while j < n and self.lumps[j].name in BINARY_MAP_LUMPS:
+                    collected[self.lumps[j].name] = self.lumps[j].data
+                    j += 1
+                fmt = "hexen" if "BEHAVIOR" in collected else "doom"
                 groups.append(MapLumpGroup(name=name, format=fmt, lumps=collected))
                 i = j
             else:
@@ -108,14 +123,17 @@ class WadFile:
         flats: dict[str, bytes] = {}
         lump_names = self.lump_names()
         for start_marker, end_marker in FLAT_MARKERS:
-            try:
-                start = lump_names.index(start_marker)
-                end = lump_names.index(end_marker, start)
-            except ValueError:
-                continue
-            for l in self.lumps[start + 1: end]:
-                if l.name and l.data:  # skip sub-markers like F1_START
-                    flats[l.name] = l.data
+            search_from = 0
+            while True:  # merged PWADs can contain several marker spans
+                try:
+                    start = lump_names.index(start_marker, search_from)
+                    end = lump_names.index(end_marker, start)
+                except ValueError:
+                    break
+                for l in self.lumps[start + 1: end]:
+                    if l.name and l.data:  # skip sub-markers like F1_START
+                        flats[l.name] = l.data
+                search_from = end + 1
         return flats
 
     def find_flat_names(self) -> list[str]:

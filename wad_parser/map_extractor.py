@@ -15,7 +15,8 @@ from collections import defaultdict, deque
 
 from wad_parser import lump_parser, udmf_parser
 from wad_parser.types import (
-    BoundingBox, DerivedData, MapDocument, MapMeta, SCHEMA_VERSION,
+    BoundingBox, DerivedData, HEXEN_UDMF_NAMESPACES, MapDocument, MapMeta,
+    SCHEMA_VERSION,
 )
 from wad_parser.wad_reader import MapLumpGroup, WadFile
 
@@ -87,56 +88,132 @@ def _sector_adjacency(sectors, linedefs, sidedefs) -> dict:
     return {"nodes": [s.id for s in sectors], "edges": edges}
 
 
-# Linedef specials that teleport the player: vanilla W1/WR (any-thing and
-# monster-only) plus the Boom W1/WR silent-teleport variants. Without these,
-# reachability analysis treats every teleporter-linked area as disconnected
-# geometry, which is wrong - teleporters are normal, common map design, not
-# a defect - so they get their own edge kind rather than being folded into
-# (or omitted from) the walk-adjacency graph.
-_TELEPORT_SPECIALS = {39, 97, 125, 126, 207, 208, 209, 210, 243, 244}
+# Doom-namespace linedef specials that teleport to a teleport-dest THING in
+# the tagged sector: vanilla W1/WR (39/97) and monster-only (125/126), Boom
+# switch-activated (174/195), Boom silent (207-210), Boom monster-only
+# silent (268/269). Without these, reachability analysis treats every
+# teleporter-linked area as disconnected geometry, which is wrong -
+# teleporters are normal, common map design, not a defect - so they get
+# their own edge kind rather than being folded into (or omitted from) the
+# walk-adjacency graph.
+_THING_TELEPORT_SPECIALS = {39, 97, 125, 126, 174, 195, 207, 208, 209, 210, 268, 269}
+# Boom line-to-line teleports: the destination is the OTHER linedef with the
+# same tag, not a thing (243/244 plus reversed/monster-only variants).
+_LINE_TELEPORT_SPECIALS = {243, 244, 262, 263, 264, 265, 266, 267}
+# Hexen action specials that teleport to a TeleportDest/MapSpot thing whose
+# TID is the special's first argument.
+_HEXEN_TELEPORT_SPECIALS = {70, 71}
 
 
-def _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices) -> list[dict]:
-    if not any(ld.special in _TELEPORT_SPECIALS for ld in linedefs):
-        return []
-    dest_by_sector: list[tuple[int, int]] = []  # (sector_id, sector_tag)
-    tag_by_sector = {s.id: s.tag for s in sectors}
-    for t in things:
-        if t.category != "teleport-dest":
-            continue
-        sec = _sector_containing(t.x, t.y, sectors, polygons, vertices)
-        if sec is not None:
-            dest_by_sector.append((sec, tag_by_sector.get(sec, 0)))
-    if not dest_by_sector:
-        return []
+def _front_sector(ld, sidedefs) -> int | None:
+    if ld.right_sidedef == -1 or ld.right_sidedef >= len(sidedefs):
+        return None
+    return sidedefs[ld.right_sidedef].sector
 
-    edges = []
-    for ld in linedefs:
-        if ld.special not in _TELEPORT_SPECIALS:
-            continue
-        if ld.right_sidedef == -1 or ld.right_sidedef >= len(sidedefs):
-            continue
-        src_sector = sidedefs[ld.right_sidedef].sector
-        # Tagged teleporters (Boom/Hexen) target only destinations in a
-        # same-tagged sector; untagged (vanilla) teleporters aren't
-        # disambiguated by the game either, so connect to every destination.
-        candidates = [s for s, tag in dest_by_sector if ld.tag and tag == ld.tag] if ld.tag else \
-            [s for s, _ in dest_by_sector]
-        for dest_sector in candidates:
-            if dest_sector != src_sector:
-                edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id, "kind": "teleport"})
+
+def _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices,
+                    hexen_style: bool) -> list[dict]:
+    edges: list[dict] = []
+    thing_sector_cache: dict[int, int | None] = {}
+
+    def sector_of_thing(t):
+        if t.id not in thing_sector_cache:
+            thing_sector_cache[t.id] = _sector_containing(t.x, t.y, sectors, polygons, vertices)
+        return thing_sector_cache[t.id]
+
+    if hexen_style:
+        for ld in linedefs:
+            if ld.special not in _HEXEN_TELEPORT_SPECIALS or not ld.args:
+                continue
+            src_sector = _front_sector(ld, sidedefs)
+            if src_sector is None:
+                continue
+            dest_tid = ld.args[0]
+            for t in things:
+                # A nonzero arg0 addresses a destination by TID (any thing
+                # type - ZDoom MapSpots resolve as "unknown" here); arg0 == 0
+                # means "any TeleportDest".
+                if dest_tid:
+                    if t.tid != dest_tid:
+                        continue
+                elif t.category != "teleport-dest":
+                    continue
+                dest = sector_of_thing(t)
+                if dest is not None and dest != src_sector:
+                    edges.append({"a": src_sector, "b": dest, "linedef": ld.id, "kind": "teleport"})
+        return edges
+
+    # --- Doom/Boom namespace ---
+    if any(ld.special in _THING_TELEPORT_SPECIALS for ld in linedefs):
+        dest_by_sector: list[tuple[int, int]] = []  # (sector_id, sector_tag)
+        tag_by_sector = {s.id: s.tag for s in sectors}
+        for t in things:
+            if t.category != "teleport-dest":
+                continue
+            sec = sector_of_thing(t)
+            if sec is not None:
+                dest_by_sector.append((sec, tag_by_sector.get(sec, 0)))
+        for ld in linedefs:
+            if ld.special not in _THING_TELEPORT_SPECIALS:
+                continue
+            src_sector = _front_sector(ld, sidedefs)
+            if src_sector is None:
+                continue
+            # Tagged teleporters target only destinations in a same-tagged
+            # sector; untagged (invalid in-game) connect to every destination.
+            candidates = [s for s, tag in dest_by_sector if ld.tag and tag == ld.tag] if ld.tag else \
+                [s for s, _ in dest_by_sector]
+            for dest_sector in candidates:
+                if dest_sector != src_sector:
+                    edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id, "kind": "teleport"})
+
+    line_teleports = [ld for ld in linedefs if ld.special in _LINE_TELEPORT_SPECIALS and ld.tag]
+    if line_teleports:
+        lines_by_tag: dict[int, list] = defaultdict(list)
+        for ld in linedefs:
+            if ld.tag:
+                lines_by_tag[ld.tag].append(ld)
+        for ld in line_teleports:
+            src_sector = _front_sector(ld, sidedefs)
+            if src_sector is None:
+                continue
+            for other in lines_by_tag[ld.tag]:
+                if other.id == ld.id:
+                    continue
+                dest_sector = _front_sector(other, sidedefs)
+                if dest_sector is not None and dest_sector != src_sector:
+                    edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id, "kind": "teleport"})
     return edges
 
 
-def _trigger_map(sectors, linedefs) -> dict[str, list[int]]:
+# Hexen action-special families whose first argument is a sector tag; used
+# to feed the trigger map for Hexen-format / Hexen-namespace-UDMF maps,
+# where linedefs have args instead of a tag field. (Specials outside these
+# families point their arg0 at lines, things, scripts, or nothing.)
+_HEXEN_SECTOR_TAG_FAMILIES = (
+    "Door_", "Floor_", "Ceiling_", "Plat_", "Stairs_", "Pillar_",
+    "FloorAndCeiling_", "Elevator_", "Light_", "Generic", "Sector_",
+)
+
+
+def _effective_sector_tag(ld, hexen_style: bool) -> int:
+    if not hexen_style:
+        return ld.tag
+    if ld.args and ld.special_name and ld.special_name.startswith(_HEXEN_SECTOR_TAG_FAMILIES):
+        return ld.args[0]
+    return 0
+
+
+def _trigger_map(sectors, linedefs, hexen_style: bool = False) -> dict[str, list[int]]:
     tag_to_sectors: dict[int, list[int]] = defaultdict(list)
     for s in sectors:
         if s.tag:
             tag_to_sectors[s.tag].append(s.id)
     triggers: dict[str, list[int]] = defaultdict(list)
     for ld in linedefs:
-        if ld.special and ld.tag and ld.tag in tag_to_sectors:
-            for sector_id in tag_to_sectors[ld.tag]:
+        tag = _effective_sector_tag(ld, hexen_style)
+        if ld.special and tag and tag in tag_to_sectors:
+            for sector_id in tag_to_sectors[tag]:
                 triggers[str(sector_id)].append(ld.id)
     return dict(triggers)
 
@@ -337,19 +414,25 @@ def _parse_udmf_group(group: MapLumpGroup):
     linedefs = udmf_parser.build_linedefs(doc)
     sidedefs = udmf_parser.build_sidedefs(doc)
     things = udmf_parser.build_things(doc)
-    return vertices, sectors, linedefs, sidedefs, things
+    return vertices, sectors, linedefs, sidedefs, things, doc
 
 
 def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) -> MapDocument:
+    doc_extra: dict = {}
     if group.format == "udmf":
-        vertices, sectors, linedefs, sidedefs, things = _parse_udmf_group(group)
+        vertices, sectors, linedefs, sidedefs, things, udmf_doc = _parse_udmf_group(group)
+        doc_extra["udmf_namespace"] = udmf_doc.namespace
+        doc_extra["udmf_globals"] = {k: v for k, v in udmf_doc.globals.items() if k != "namespace"}
+        hexen_style = (udmf_doc.namespace or "").lower() in HEXEN_UDMF_NAMESPACES
     else:
         vertices, sectors, linedefs, sidedefs, things = _parse_binary_group(group)
+        hexen_style = group.format == "hexen"
 
     polygons = _sector_polygons(sectors, linedefs, sidedefs)
     adjacency = _sector_adjacency(sectors, linedefs, sidedefs)
-    adjacency["edges"] += _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices)
-    triggers = _trigger_map(sectors, linedefs)
+    adjacency["edges"] += _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices,
+                                          hexen_style=hexen_style)
+    triggers = _trigger_map(sectors, linedefs, hexen_style=hexen_style)
     reachable = _reachable_from_start(sectors, things, polygons, vertices, adjacency)
     alignment = _texture_alignment_score(sectors, linedefs, sidedefs, polygons)
     bounds = _bounds(vertices)
@@ -387,14 +470,18 @@ def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) 
         sidedefs=sidedefs,
         things=things,
         derived=derived,
+        extra=doc_extra,
     )
 
 
 def extract_all_maps(wad: WadFile) -> list[MapDocument]:
     from wad_parser.mapinfo_parser import parse_mapinfo
 
+    # UMAPINFO (the Boom/MBF21-lineage standard) uses the same
+    # `map MAPxx { key = value }` shape the tolerant parser handles; listed
+    # first so the more specific port dialects override it where both exist.
     mapinfo = {}
-    for lump_name in ("MAPINFO", "ZMAPINFO", "EMAPINFO"):
+    for lump_name in ("UMAPINFO", "MAPINFO", "ZMAPINFO", "EMAPINFO"):
         data = wad.get_lump(lump_name)
         if data:
             mapinfo.update(parse_mapinfo(data))
