@@ -149,7 +149,12 @@ def vectorize(raster: np.ndarray, cell_units: int = 64, coarse_factor: int = 4,
               simplify_tolerance: float = 1.3, min_region_cells: int = 3) -> MapDocument:
     """Raster (9, R, R) -> doom-format MapDocument. Raises ValueError when
     the raster contains no usable interior."""
-    painted = raster[1:7].max(axis=0) > interior_threshold
+    # With an occupancy channel (index 9) present, void is explicit: threshold
+    # it at 0.5. Otherwise fall back to "any structural channel is nonzero".
+    if raster.shape[0] >= 10:
+        painted = raster[9] > 0.5
+    else:
+        painted = raster[1:7].max(axis=0) > interior_threshold
     coverage = _downsample(painted.astype(np.float64), coarse_factor)
     safe_cov = np.maximum(coverage, 1e-9)
 

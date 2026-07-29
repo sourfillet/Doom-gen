@@ -23,13 +23,21 @@ class GaussianDiffusion(nn.Module):
         ac = self.alphas_cumprod[t][:, None, None, None]
         return ac.sqrt() * x0 + (1 - ac).sqrt() * noise
 
-    def loss(self, x0: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        """Standard epsilon-prediction MSE at a uniformly sampled t."""
+    def loss(self, x0: torch.Tensor, cond: torch.Tensor,
+             channel_weights: torch.Tensor | None = None) -> torch.Tensor:
+        """Epsilon-prediction MSE at a uniformly sampled t. channel_weights
+        (C,) upweights specific channels' denoising accuracy - used to make
+        the model prioritize the sharp binary occupancy channel over the
+        smooth height channels, so it actually learns void."""
         b = x0.shape[0]
         t = torch.randint(0, self.timesteps, (b,), device=x0.device)
         noise = torch.randn_like(x0)
         x_t = self.q_sample(x0, t, noise)
-        return F.mse_loss(self.model(x_t, t, cond), noise)
+        pred = self.model(x_t, t, cond)
+        if channel_weights is None:
+            return F.mse_loss(pred, noise)
+        w = channel_weights.to(x0.device).view(1, -1, 1, 1)
+        return (F.mse_loss(pred, noise, reduction="none") * w).mean()
 
     @torch.no_grad()
     def ddim_sample(self, shape, cond: torch.Tensor, uncond: torch.Tensor,

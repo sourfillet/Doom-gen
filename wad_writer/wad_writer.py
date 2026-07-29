@@ -13,10 +13,15 @@ from pathlib import Path
 
 from wad_parser.types import MapDocument
 from wad_writer.assembler import MAP_LUMP_ORDER, assemble_map_lumps
+from wad_writer.assets import AssetBundle
 
 
-def write_wad(docs: list[MapDocument], path: Path | str) -> Path:
-    """Writes one PWAD containing every given map, in order."""
+def write_wad(docs: list[MapDocument], path: Path | str,
+              assets: AssetBundle | None = None) -> Path:
+    """Writes one PWAD containing every given map, in order. If an
+    AssetBundle is given, its custom flats/patches/textures (plus the
+    PNAMES/TEXTURE1 lumps describing them) are appended so the map can use
+    graphics beyond the target IWAD."""
     path = Path(path)
     lumps: list[tuple[str, bytes]] = []
     for doc in docs:
@@ -24,6 +29,8 @@ def write_wad(docs: list[MapDocument], path: Path | str) -> Path:
         lumps.append((doc.meta.map_name, b""))
         for name in MAP_LUMP_ORDER:
             lumps.append((name, assembled[name]))
+    if assets is not None and not assets.is_empty:
+        lumps += assets.build_lumps()
 
     body = b""
     directory = b""

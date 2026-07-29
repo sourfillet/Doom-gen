@@ -11,6 +11,9 @@ Channel layout (all float32 in [0, 1]):
     6  sector-ID coloring   (id+1)/n_sectors - topology hint, not a value
     7  linedef special density   line-rasterized specials, max-normalized
     8  thing density             cell counts, max-normalized
+    9  occupancy                 binary 1=sector here, 0=void - the explicit
+                                 negative-space target so the model learns
+                                 rooms-in-void instead of filling the canvas
 
 Two height encodings are kept because both matter: the model needs the
 map's internal shape (relative) AND real-world scale (absolute - an 8-unit
@@ -28,7 +31,8 @@ import numpy as np
 
 from wad_parser.types import MapDocument
 
-N_CHANNELS = 9
+N_CHANNELS = 10
+OCCUPANCY_CHANNEL = 9
 ABS_HEIGHT_SCALE = 1024.0
 
 
@@ -133,6 +137,7 @@ def rasterize(doc: MapDocument, resolution: int = 128) -> tuple[np.ndarray, dict
         raster[4, rr, cc] = np.clip(s.ceil_height / ABS_HEIGHT_SCALE, -1, 1) * 0.5 + 0.5
         raster[5, rr, cc] = np.clip(s.light_level, 0, 255) / 255.0
         raster[6, rr, cc] = (s.id + 1) / n_sectors
+        raster[OCCUPANCY_CHANNEL, rr, cc] = 1.0   # negative-space target
 
     # --- line channels (0, 7) ---
     for ld in doc.linedefs:

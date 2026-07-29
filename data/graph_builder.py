@@ -56,10 +56,14 @@ def _ring_area_perimeter(ring, vpos) -> tuple[float, float]:
     return abs(area) / 2.0, perim
 
 
-def build_graph(doc: MapDocument) -> dict[str, np.ndarray]:
+def build_graph(doc: MapDocument, count_things: bool = True) -> dict[str, np.ndarray]:
     """Returns {"node_features": (N, F), "edge_index": (2, 2E), and
     "edge_features": (2E, Fe)} - every undirected link appears once per
-    direction."""
+    direction.
+
+    count_things=False leaves the per-sector thing-count columns (9-12) at
+    zero and skips the point-in-sector test for every thing - a big speedup
+    for callers (Stage 3) that only read geometry columns."""
     b = doc.bounds
     bbox_area = max((b.max_x - b.min_x) * (b.max_y - b.min_y), 1.0)
     diag = max(math.hypot(b.max_x - b.min_x, b.max_y - b.min_y), 1.0)
@@ -68,7 +72,7 @@ def build_graph(doc: MapDocument) -> dict[str, np.ndarray]:
 
     # per-sector thing counts
     counts = {s.id: {"monster": 0, "pickup": 0, "key": 0, "start": 0} for s in doc.sectors}
-    for t in doc.things:
+    for t in (doc.things if count_things else ()):
         sec = _sector_containing(t.x, t.y, doc.sectors, doc.derived.sector_polygons, doc.vertices)
         if sec is None or sec not in counts:
             continue
