@@ -83,23 +83,56 @@ def radial_layout(graph: RoomGraph, seed: int = 0) -> dict[int, tuple[float, flo
             demand[u] = max(1, sum(demand[c] for c in children[u]))
 
     ring = 2.4 * (sum(rad.values()) / len(ids)) + 220.0   # radius per depth level
-    pos: dict[int, tuple[float, float]] = {}
+    pos: dict[int, list] = {}
     interval = {root: (0.0, 2 * math.pi)}
-    pos[root] = (0.0, 0.0)
+    pos[root] = [0.0, 0.0]
     for u in order:
         a0, a1 = interval.get(u, (0.0, 2 * math.pi))
         width = a1 - a0
         if parent[u] is not None:
             ang = (a0 + a1) / 2 + rng.uniform(-0.16, 0.16) * width
             r = depth[u] * ring * (1.0 + rng.uniform(-0.12, 0.12))
-            pos[u] = (r * math.cos(ang), r * math.sin(ang))
+            pos[u] = [r * math.cos(ang), r * math.sin(ang)]
         tot = sum(demand[c] for c in children[u]) or 1
         cur = a0
         for c in children[u]:                       # split arc among children
             w = width * demand[c] / tot
             interval[c] = (cur, cur + w)
             cur += w
-    return pos
+    _separate(pos, rad)                             # guarantee no room overlap
+    return {i: (pos[i][0], pos[i][1]) for i in ids}
+
+
+def _separate(pos: dict, rad: dict, iterations: int = 120) -> None:
+    """Push rooms apart until their bounding circles are disjoint - once the
+    circles clear, the real polygons (which sit inside them) cannot overlap.
+    Radial layout separates centroids by wedge but real room shapes have extent
+    and adjacent-wedge rooms can still cross. In place."""
+    ids = list(pos)
+    for _ in range(iterations):
+        disp = {i: [0.0, 0.0] for i in ids}
+        moved = False
+        for a in range(len(ids)):
+            ia = ids[a]
+            for b in range(a + 1, len(ids)):
+                ib = ids[b]
+                dx = pos[ia][0] - pos[ib][0]
+                dy = pos[ia][1] - pos[ib][1]
+                d = math.hypot(dx, dy) or 0.01
+                want = rad[ia] + rad[ib] + 64.0     # circles clear + corridor slack
+                if d < want:
+                    f = (want - d) * 0.5
+                    ux, uy = dx / d, dy / d
+                    disp[ia][0] += ux * f
+                    disp[ia][1] += uy * f
+                    disp[ib][0] -= ux * f
+                    disp[ib][1] -= uy * f
+                    moved = True
+        for i in ids:
+            pos[i][0] += disp[i][0]
+            pos[i][1] += disp[i][1]
+        if not moved:
+            break
 
 
 def add_loops(graph: RoomGraph, positions: dict[int, tuple[float, float]],

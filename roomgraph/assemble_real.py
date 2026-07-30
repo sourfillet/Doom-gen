@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 
-from roomgraph.corridor import plan_corridor, seg_intersect, signed_area
+from roomgraph.corridor import plan_candidates, seg_intersect, signed_area
 from roomgraph.layout import radial_layout
 from roomgraph.types import RoomGraph
 from wad_parser.map_extractor import compute_derived
@@ -188,7 +188,7 @@ def assemble_real(graph: RoomGraph, positions=None, seed: int = 0) -> MapDocumen
     # --- plan + emit corridors; accumulate wall openings per (room, edge)
     openings: dict[int, dict[int, list[tuple[float, float]]]] = {
         rid: {} for rid in polys}
-    laid: list[tuple[tuple, tuple]] = []          # placed corridor centrelines
+    laid_quads: list[list[tuple[float, float]]] = []   # placed corridor quads
     uf = {rid: rid for rid in polys}              # union-find over corridor-joined rooms
 
     def _find(x):
@@ -200,76 +200,97 @@ def assemble_real(graph: RoomGraph, positions=None, seed: int = 0) -> MapDocumen
     def _union(a, b):
         uf[_find(a)] = _find(b)
 
-    def _mid(p, q):
-        return ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2)
+    def _poly_overlap(P, Q):
+        # two polygons overlap if an edge properly crosses OR one contains the
+        # other's interior (a corner). Corridors share only an opening EDGE with
+        # their rooms (collinear, not a proper cross), so this doesn't false-fire
+        # on the legitimate mouth.
+        nP, nQ = len(P), len(Q)
+        for i in range(nP):
+            p1, p2 = P[i], P[(i + 1) % nP]
+            for j in range(nQ):
+                if seg_intersect(p1, p2, Q[j], Q[(j + 1) % nQ]):
+                    return True
+        return _point_in_poly(P[0], Q) or _point_in_poly(Q[0], P)
 
-    def _blocked(m0, m1, ra, rb):
-        # corridor centreline must not tunnel through a third room or cross an
-        # already-placed corridor (either = overlapping sectors / HOM in engine)
+    def _seg_crosses_poly(p, q, poly):
+        n = len(poly)
+        return any(seg_intersect(p, q, poly[i], poly[(i + 1) % n]) for i in range(n))
+
+    def _quad_blocked(quad, side_walls, ra, rb):
+        # a corridor has WIDTH: test the whole quad (not just its centreline)
+        # against every other room and every already-placed corridor, so
+        # fanned-out hub corridors and tangential loop chords can't overlap.
         for rid, poly in polys.items():
             if rid == ra or rid == rb:
                 continue
-            if _point_in_poly(m0, poly) or _point_in_poly(m1, poly):
+            if _poly_overlap(quad, poly):
                 return True
-            n = len(poly)
-            for i in range(n):
-                if seg_intersect(m0, m1, poly[i], poly[(i + 1) % n]):
-                    return True
-        for q0, q1 in laid:
-            if seg_intersect(m0, m1, q0, q1):
+        for q in laid_quads:
+            if _poly_overlap(quad, q):
+                return True
+        # a concave endpoint room can have the corridor's SIDE WALL re-cross a
+        # far wall of that same room (it shares only the opening edge, which the
+        # side walls only touch at an endpoint - not a proper crossing)
+        for p, q in side_walls:
+            if _seg_crosses_poly(p, q, polys[ra]) or _seg_crosses_poly(p, q, polys[rb]):
                 return True
         return False
 
-    def record(rid, plan_side):
-        spans = openings[rid].setdefault(plan_side.edge, [])
-        for d0, d1 in spans:                       # reject overlapping carves
+    def _span_free(rid, plan_side):
+        for d0, d1 in openings[rid].get(plan_side.edge, []):   # non-overlapping carve
             if plan_side.d0 < d1 - _EPS and d0 < plan_side.d1 - _EPS:
                 return False
-        spans.append((plan_side.d0, plan_side.d1))
         return True
+
+    def _commit_span(rid, plan_side):
+        openings[rid].setdefault(plan_side.edge, []).append((plan_side.d0, plan_side.d1))
 
     for c in graph.connections:
         if c.kind == "teleport" or c.a not in polys or c.b not in polys:
             continue
-        plan = plan_corridor(origins[c.a], polys[c.a], origins[c.b], polys[c.b])
-        if plan is None:
-            continue
-        a0, a1 = plan.a.p0, plan.a.p1
-        b0, b1 = plan.b.p0, plan.b.p1
-        ring = _cw_quad(a0, a1, b0, b1)            # simple CW quad or None (twisted)
-        if ring is None:
-            continue
-        mA, mB = _mid(a0, a1), _mid(b0, b1)
-        if _blocked(mA, mB, c.a, c.b):             # tunnels a room / crosses a corridor
-            continue
-        if not record(c.a, plan.a) or not record(c.b, plan.b):
-            continue
-        laid.append((mA, mB))
-        _union(c.a, c.b)
-        ra, rb = room_by_id[c.a], room_by_id[c.b]
-        floor = min(ra.floor_h, rb.floor_h)
-        ceil = max(floor + 64, min(ra.ceil_h, rb.ceil_h))
-        cs = len(sectors)
-        sectors.append(Sector(id=cs, floor_height=int(floor), ceil_height=int(ceil),
-                              floor_flat=FLOOR, ceil_flat=CEIL, light_level=144,
-                              special=0, tag=0))
-        door = DOOR_SPECIAL if c.kind == "door" else 0
-        # walk the CW ring: corridor interior on the right of every edge. An edge
-        # between same-room corners is that room's shared mouth (two-sided);
-        # a mixed edge is a corridor side wall (one-sided).
-        for k in range(4):
-            (p, tp), (q, tq) = ring[k], ring[(k + 1) % 4]
-            if tp == tq == "A":
-                # a door acts on its BACK sector; emit reversed so the small
-                # corridor (not the whole room) is the moving door sector
-                if door:
-                    add_line(q, p, sec_of[c.a], cs, special=door)
+        # try candidate wall pairs (shortest first) until one carves cleanly -
+        # lets a corridor route around a concave room instead of being dropped
+        for plan in plan_candidates(origins[c.a], polys[c.a], origins[c.b], polys[c.b]):
+            ring = _cw_quad(plan.a.p0, plan.a.p1, plan.b.p0, plan.b.p1)
+            if ring is None:
+                continue
+            quad = [p for p, _ in ring]
+            side_walls = [(ring[k][0], ring[(k + 1) % 4][0]) for k in range(4)
+                          if ring[k][1] != ring[(k + 1) % 4][1]]
+            if _quad_blocked(quad, side_walls, c.a, c.b):
+                continue
+            if not _span_free(c.a, plan.a) or not _span_free(c.b, plan.b):
+                continue
+            _commit_span(c.a, plan.a)
+            _commit_span(c.b, plan.b)
+            laid_quads.append(quad)
+            _union(c.a, c.b)
+            ra, rb = room_by_id[c.a], room_by_id[c.b]
+            floor = min(ra.floor_h, rb.floor_h)
+            ceil = max(floor + 64, min(ra.ceil_h, rb.ceil_h))
+            cs = len(sectors)
+            sectors.append(Sector(id=cs, floor_height=int(floor), ceil_height=int(ceil),
+                                  floor_flat=FLOOR, ceil_flat=CEIL, light_level=144,
+                                  special=0, tag=0))
+            door = DOOR_SPECIAL if c.kind == "door" else 0
+            # walk the CW ring: corridor interior on the right of every edge. An
+            # edge between same-room corners is that room's shared mouth (two-
+            # sided); a mixed edge is a corridor side wall (one-sided).
+            for k in range(4):
+                (p, tp), (q, tq) = ring[k], ring[(k + 1) % 4]
+                if tp == tq == "A":
+                    # a door acts on its BACK sector; emit reversed so the small
+                    # corridor (not the whole room) is the moving door sector
+                    if door:
+                        add_line(q, p, sec_of[c.a], cs, special=door)
+                    else:
+                        add_line(p, q, cs, sec_of[c.a])
+                elif tp == tq == "B":
+                    add_line(p, q, cs, sec_of[c.b])
                 else:
-                    add_line(p, q, cs, sec_of[c.a])
-            elif tp == tq == "B":
-                add_line(p, q, cs, sec_of[c.b])
-            else:
-                add_line(p, q, cs)
+                    add_line(p, q, cs)
+            break                                       # this connection is placed
 
     # --- room walls, skipping the carved opening spans
     for rid, poly in polys.items():

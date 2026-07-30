@@ -125,15 +125,15 @@ def _closest_boundary_point(poly, target):
     return (best[1], best[2]) if best else None
 
 
-def _facing_edge(poly, target):
-    """Pick the LONG wall that best faces `target` and open there (at target's
-    projection). Real room outlines have many tiny edges; aiming at the single
-    closest boundary point often lands on one too short to carve. Choosing the
-    longest outward-facing wall makes the opening fit. Returns (edge, point)."""
+def _facing_edges(poly, target, k=4):
+    """Ranked candidate walls that face `target`, best first: long, aimed at
+    the target, and near. Returns up to k (edge, point) so the assembler can
+    try alternatives when the best wall's straight corridor would clip a
+    concave room. Falls back to the closest boundary point if none qualify."""
     n = len(poly)
     cx = sum(p[0] for p in poly) / n
     cy = sum(p[1] for p in poly) / n
-    best = None
+    scored = []
     for i in range(n):
         p, q = poly[i], poly[(i + 1) % n]
         ex, ey = q[0] - p[0], q[1] - p[1]
@@ -151,12 +151,19 @@ def _facing_edge(poly, target):
         if facing <= 0.05:                          # wall faces away
             continue
         score = facing + 0.0004 * L - 0.0003 * tlen    # face target, long, near
-        if best is None or score > best[0]:
-            cp, _ = _closest_on_segment(target, p, q)
-            best = (score, i, cp)
-    if best is not None:
-        return best[1], best[2]
-    return _closest_boundary_point(poly, target)    # spiky room: best effort
+        cp, _ = _closest_on_segment(target, p, q)
+        scored.append((score, i, cp))
+    scored.sort(reverse=True)
+    if scored:
+        return [(i, cp) for _, i, cp in scored[:k]]
+    cb = _closest_boundary_point(poly, target)      # spiky room: best effort
+    return [cb] if cb else []
+
+
+def _facing_edge(poly, target):
+    """Single best facing wall (edge, point), or None."""
+    edges = _facing_edges(poly, target, k=1)
+    return edges[0] if edges else None
 
 
 def _dist_along(poly, edge, pt):
@@ -168,19 +175,36 @@ def _dist_along(poly, edge, pt):
     return ((pt[0] - px) * ex + (pt[1] - py) * ey) / L
 
 
+def _mid(o):
+    return ((o.p0[0] + o.p1[0]) / 2, (o.p0[1] + o.p1[1]) / 2)
+
+
+def plan_candidates(origin_a, poly_a, origin_b, poly_b, k=4):
+    """All viable corridor plans over the top-k facing walls of each room,
+    shortest first. The assembler tries them in order and takes the first that
+    carves cleanly (doesn't clip a concave room or an existing corridor)."""
+    sides_a = [(_opening(poly_a, e, _dist_along(poly_a, e, p)))
+               for e, p in _facing_edges(poly_a, origin_b, k)]
+    sides_b = [(_opening(poly_b, e, _dist_along(poly_b, e, p)))
+               for e, p in _facing_edges(poly_b, origin_a, k)]
+    plans = []
+    for oa in sides_a:
+        if oa is None:
+            continue
+        for ob in sides_b:
+            if ob is None:
+                continue
+            ma, mb = _mid(oa), _mid(ob)
+            d = math.hypot(ma[0] - mb[0], ma[1] - mb[1])
+            plans.append((d, CorridorPlan(a=oa, b=ob)))
+    plans.sort(key=lambda t: t[0])
+    return [p for _, p in plans]
+
+
 def plan_corridor(origin_a, poly_a, origin_b, poly_b) -> CorridorPlan | None:
-    """Plan the opening on each room by carving on the wall each room presents
-    toward the OTHER room's interior point (origin). Robust on concave shapes
-    and short edges, where centroid ray-casting failed (dropped corridors)."""
-    ba = _facing_edge(poly_a, origin_b)
-    bb = _facing_edge(poly_b, origin_a)
-    if ba is None or bb is None:
-        return None
-    oa = _opening(poly_a, ba[0], _dist_along(poly_a, ba[0], ba[1]))
-    ob = _opening(poly_b, bb[0], _dist_along(poly_b, bb[0], bb[1]))
-    if oa is None or ob is None:
-        return None
-    return CorridorPlan(a=oa, b=ob)
+    """Single best corridor plan (facing wall on each room), or None."""
+    plans = plan_candidates(origin_a, poly_a, origin_b, poly_b, k=1)
+    return plans[0] if plans else None
 
 
 def seg_intersect(p1, p2, p3, p4) -> bool:
