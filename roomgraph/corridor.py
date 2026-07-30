@@ -73,37 +73,111 @@ def _ray_exit(origin, target, poly):
 
 
 def _opening(poly, edge, dist_from_start, half=CORR_HALF):
-    """Widen a crossing at `dist_from_start` along edge into a clamped span."""
+    """Widen a crossing at `dist_from_start` along edge into a clamped span.
+
+    Lenient on short edges: if the whole edge is shorter than the ideal opening
+    we use as much of it as we can (down to a hard passable floor) rather than
+    giving up - a narrow doorway still connects the rooms."""
     n = len(poly)
     px, py = poly[edge]
     qx, qy = poly[(edge + 1) % n]
     ex, ey = qx - px, qy - py
     L = math.hypot(ex, ey)
-    if L < MIN_OPENING:
+    floor = min(MIN_OPENING, 40.0)                 # hard "still walkable" width
+    if L < floor:
         return None
     ux, uy = ex / L, ey / L
     d0 = max(0.0, dist_from_start - half)
     d1 = min(L, dist_from_start + half)
-    if d1 - d0 < MIN_OPENING:
-        # try to slide the window inside the edge before giving up
-        if L >= MIN_OPENING:
-            d0 = min(max(dist_from_start - half, 0.0), L - MIN_OPENING)
-            d1 = d0 + min(2 * half, L)
-        if d1 - d0 < MIN_OPENING:
-            return None
+    if d1 - d0 < MIN_OPENING:                      # slide the window inward
+        want = min(2 * half, L)
+        d0 = min(max(dist_from_start - want / 2, 0.0), L - want)
+        d1 = d0 + want
+    if d1 - d0 < floor:
+        return None
     p0 = (px + ux * d0, py + uy * d0)
     p1 = (px + ux * d1, py + uy * d1)
     return Opening(edge=edge, d0=d0, d1=d1, p0=p0, p1=p1)
 
 
+def _closest_on_segment(p, a, b):
+    """Closest point on segment a-b to point p, and its distance-from-a param."""
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    L2 = dx * dx + dy * dy
+    if L2 < _EPS:
+        return a, 0.0
+    t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / L2
+    t = max(0.0, min(1.0, t))
+    return (ax + t * dx, ay + t * dy), t
+
+
+def _closest_boundary_point(poly, target):
+    """Boundary point of `poly` closest to `target`, and the edge it lies on.
+    Returns (edge_index, point). Fallback for _facing_edge."""
+    best = None
+    n = len(poly)
+    for i in range(n):
+        cp, _ = _closest_on_segment(target, poly[i], poly[(i + 1) % n])
+        d = math.hypot(target[0] - cp[0], target[1] - cp[1])
+        if best is None or d < best[0]:
+            best = (d, i, cp)
+    return (best[1], best[2]) if best else None
+
+
+def _facing_edge(poly, target):
+    """Pick the LONG wall that best faces `target` and open there (at target's
+    projection). Real room outlines have many tiny edges; aiming at the single
+    closest boundary point often lands on one too short to carve. Choosing the
+    longest outward-facing wall makes the opening fit. Returns (edge, point)."""
+    n = len(poly)
+    cx = sum(p[0] for p in poly) / n
+    cy = sum(p[1] for p in poly) / n
+    best = None
+    for i in range(n):
+        p, q = poly[i], poly[(i + 1) % n]
+        ex, ey = q[0] - p[0], q[1] - p[1]
+        L = math.hypot(ex, ey)
+        if L < MIN_OPENING:
+            continue
+        mx, my = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2
+        nx, ny = -ey, ex                            # a perpendicular
+        if nx * (mx - cx) + ny * (my - cy) < 0:     # orient it OUTWARD
+            nx, ny = -nx, -ny
+        nlen = math.hypot(nx, ny) or 1.0
+        tx, ty = target[0] - mx, target[1] - my
+        tlen = math.hypot(tx, ty) or 1.0
+        facing = (nx * tx + ny * ty) / (nlen * tlen)   # cos(normal, dir-to-target)
+        if facing <= 0.05:                          # wall faces away
+            continue
+        score = facing + 0.0004 * L - 0.0003 * tlen    # face target, long, near
+        if best is None or score > best[0]:
+            cp, _ = _closest_on_segment(target, p, q)
+            best = (score, i, cp)
+    if best is not None:
+        return best[1], best[2]
+    return _closest_boundary_point(poly, target)    # spiky room: best effort
+
+
+def _dist_along(poly, edge, pt):
+    n = len(poly)
+    px, py = poly[edge]
+    qx, qy = poly[(edge + 1) % n]
+    ex, ey = qx - px, qy - py
+    L = math.hypot(ex, ey) or 1.0
+    return ((pt[0] - px) * ex + (pt[1] - py) * ey) / L
+
+
 def plan_corridor(origin_a, poly_a, origin_b, poly_b) -> CorridorPlan | None:
-    """Plan the opening on each room for a straight A<->B corridor."""
-    ea = _ray_exit(origin_a, origin_b, poly_a)
-    eb = _ray_exit(origin_b, origin_a, poly_b)
-    if ea is None or eb is None:
+    """Plan the opening on each room by carving on the wall each room presents
+    toward the OTHER room's interior point (origin). Robust on concave shapes
+    and short edges, where centroid ray-casting failed (dropped corridors)."""
+    ba = _facing_edge(poly_a, origin_b)
+    bb = _facing_edge(poly_b, origin_a)
+    if ba is None or bb is None:
         return None
-    oa = _opening(poly_a, ea[0], ea[2])
-    ob = _opening(poly_b, eb[0], eb[2])
+    oa = _opening(poly_a, ba[0], _dist_along(poly_a, ba[0], ba[1]))
+    ob = _opening(poly_b, bb[0], _dist_along(poly_b, bb[0], bb[1]))
     if oa is None or ob is None:
         return None
     return CorridorPlan(a=oa, b=ob)

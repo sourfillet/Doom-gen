@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 
 from roomgraph.corridor import plan_corridor, seg_intersect, signed_area
-from roomgraph.layout import force_layout
+from roomgraph.layout import radial_layout
 from roomgraph.types import RoomGraph
 from wad_parser.map_extractor import compute_derived
 from wad_parser.types import (
@@ -125,7 +125,7 @@ def _complement(length, spans):
 
 
 def assemble_real(graph: RoomGraph, positions=None, seed: int = 0) -> MapDocument:
-    positions = positions or force_layout(graph, seed=seed)
+    positions = positions or radial_layout(graph, seed=seed)
 
     # --- one representative polygon per room, translated to its solved centroid
     polys: dict[int, list[tuple[float, float]]] = {}

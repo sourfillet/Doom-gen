@@ -19,6 +19,7 @@ from generation.style import StyleModel, apply_style
 from generation.validator import validate_and_repair
 from roomgraph.assemble import assemble
 from roomgraph.assemble_real import assemble_real
+from roomgraph.layout import add_loops, radial_layout
 from roomgraph.shapes import apply_shapes, load_library
 from roomgraph.types import RoomGraph
 from wad_writer.wad_writer import build_nodes, write_wad
@@ -73,7 +74,11 @@ def generate(checkpoint_path: Path | str, tags: dict[str, float], n_maps: int = 
                                map_name=name)
         if shape_library is not None:
             apply_shapes(rg, shape_library, seed=s or 0)
-            doc = assemble_real(rg, seed=s or 0)
+            # non-crossing radial layout, then add short loop edges so the map
+            # has cycles (circle-around routes) not just a spanning tree
+            pos = radial_layout(rg, seed=s or 0)
+            add_loops(rg, pos, seed=s or 0)
+            doc = assemble_real(rg, positions=pos, seed=s or 0)
         else:
             doc = assemble(rg, map_name=name)
         repairs = validate_and_repair(doc)
