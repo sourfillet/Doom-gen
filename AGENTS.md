@@ -112,6 +112,7 @@ start long training runs merely to claim broader coverage.
 
 Do not commit or redistribute commercial IWADs, copied stock graphics, large
 training corpora or generated checkpoints. Use locally available IWADs only
-for authorized testing; keep resource provenance clear. Document user-visible
-options and reproducible playtest commands in `README.md` and
+for authorized testing; keep resource provenance clear. Keep `README.md` a
+short overview with a quick start. Document user-visible options and details
+in the relevant `docs/` page, and reproducible playtest commands in
 `generated/playtest/README.md` when applicable.
