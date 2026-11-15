@@ -1,4 +1,4 @@
-"""Tagging CLI: assign user-defined tags to WADs and maps (plan/tagging.md).
+"""Tagging CLI: assign user-defined tags to WADs and maps.
 
     tag-maps tag mywad.wad techbase "slaughter:0.6"          # WAD-level
     tag-maps tag mywad.wad --map MAP03 city                  # map-level

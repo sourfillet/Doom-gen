@@ -5,3 +5,16 @@ __pycache__/
 .pytest_cache/
 wads/*
 generated/*
+build/
+dist/
+
+# Game data and model artifacts are never committed, wherever they land.
+*.[wW][aA][dD]
+*.[pP][kK][37]
+*.pt
+*.pth
+*.ckpt
+
+# ViZDoom runtime output.
+_vizdoom/
+_vizdoom.ini

@@ -1,6 +1,6 @@
 """Tag registry: every tag name the user has ever created, with their own
 free-text description (later also the text-encoder cold-start input for
-model conditioning - see plan/tagging.md).
+model conditioning).
 
 The registry is organizational, not restrictive: any string can become a
 tag the first time it's used, nothing is pre-registered, and the only
@@ -12,12 +12,19 @@ from __future__ import annotations
 import datetime
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 SCHEMA_VERSION = "1.0"
 
 _WS_RE = re.compile(r"\s+")
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def canonicalize(name: str) -> str:
@@ -45,29 +52,28 @@ class Registry:
         self.path = Path(path)
         self.tags: dict[str, TagEntry] = {}
         if self.path.exists():
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            known = {f.name for f in fields(TagEntry)}
             for canon, entry in raw.get("tags", {}).items():
-                self.tags[canon] = TagEntry(**entry)
+                self.tags[canon] = TagEntry(**{k: v for k, v in entry.items() if k in known})
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "schema_version": SCHEMA_VERSION,
             "tags": {c: vars(e) for c, e in sorted(self.tags.items())},
         }
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2))
-        tmp.replace(self.path)
+        _write_json(self.path, payload)
 
     # -- creation / lookup ------------------------------------------------
 
-    def ensure(self, name: str, description: str = "") -> str:
+    def ensure(self, name: str, description: str = "", *, save: bool = True) -> str:
         """Creates the tag on first use (single-command creation, per the
         plan); returns the canonical name either way."""
         canon = canonicalize(name)
         if canon not in self.tags:
             self.tags[canon] = TagEntry(display=name.strip(), description=description)
-            self.save()
+            if save:
+                self.save()
         return canon
 
     def __contains__(self, name: str) -> bool:

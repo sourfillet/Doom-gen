@@ -1,7 +1,6 @@
 """Tests for the Phase 3 dataset layer: JSON round-trip, rasterizer
 channels, graph tensors, augmentation invariants, and the dataset loader
 end to end."""
-import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -28,6 +27,8 @@ def _doc(tmp_path, builder=build_two_sector_wad, floor2: int | None = 64):
     doc = extract_all_maps(WadFile(str(p)))[0]
     if floor2 is not None and len(doc.sectors) > 1:
         doc.sectors[1].floor_height = floor2  # give the map some relief
+        from wad_parser.map_extractor import compute_derived
+        doc.bounds, doc.derived = compute_derived(doc.vertices, doc.sectors, doc.linedefs, doc.sidedefs, doc.things)
     return doc
 
 
@@ -67,7 +68,7 @@ def test_raster_shape_and_channels(tmp_path):
     assert raster[0].sum() > 0                      # walls drawn
     assert 0.0 <= raster.min() and raster.max() <= 1.0
     # floor-relative channel must distinguish the two sectors (0 vs 64)
-    interior = raster[6] > 0                        # sector-id channel as area mask
+    interior = raster[9] > 0                        # sector-id channel as area mask
     assert len(np.unique(np.round(raster[1][interior], 3))) >= 2
     # light 160 everywhere inside
     lights = np.unique(np.round(raster[5][interior], 3))

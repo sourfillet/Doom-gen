@@ -1,5 +1,5 @@
 """CLI: parse a WAD into per-map JSON documents (plus one WAD-wide texture
-set document), per plan/data-model.md.
+set document).
 
     parse-wad DOOM2.WAD --output ./dataset/maps/
     parse-wad mymap.wad --map MAP03 --stdout
@@ -7,9 +7,11 @@ set document), per plan/data-model.md.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
-import sys
 from pathlib import Path
+import tempfile
+from urllib.parse import quote
 
 import click
 
@@ -23,6 +25,22 @@ def _to_json(obj) -> str:
                        indent=2, sort_keys=False)
 
 
+def _write_if_changed(path: Path, text: str) -> None:
+    """Repeated extraction of the same source does not rewrite its files."""
+    if path.exists() and path.read_text() == text:
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, suffix=".tmp",
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 @click.command()
 @click.argument("wad_path", type=click.Path(exists=True, dir_okay=False))
 @click.option("--output", "output_dir", type=click.Path(file_okay=False), default=None,
@@ -31,7 +49,7 @@ def _to_json(obj) -> str:
 @click.option("--stdout", "to_stdout", is_flag=True, help="Print JSON to stdout instead of writing files.")
 def main(wad_path: str, output_dir: str | None, map_name: str | None, to_stdout: bool) -> None:
     wad = WadFile(wad_path)
-    maps = extract_all_maps(wad)
+    maps = extract_all_maps(wad, map_name=map_name)
     if map_name:
         maps = [m for m in maps if m.meta.map_name.upper() == map_name.upper()]
         if not maps:
@@ -64,12 +82,61 @@ def main(wad_path: str, output_dir: str | None, map_name: str | None, to_stdout:
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    entries = []
+    destinations = set()
     for doc in maps:
-        dest = out / f"{doc.meta.map_name}.json"
-        dest.write_text(_to_json(doc))
+        # A flat directory remains compatible with all existing dataset loaders.
+        # Escape free-form UDMF marker names so they cannot become paths.
+        dest = out / f"{wad.hash}_{quote(doc.meta.map_name, safe='')}.json"
+        if dest in destinations:
+            raise click.ClickException(f"duplicate map name in {wad_path}: {doc.meta.map_name!r}")
+        destinations.add(dest)
+        if dest.exists():
+            try:
+                old_meta = json.loads(dest.read_text())["meta"]
+                same_map = (old_meta["wad_hash"] == wad.hash
+                            and old_meta["map_name"] == doc.meta.map_name)
+            except (ValueError, KeyError, TypeError):
+                same_map = False
+            if not same_map:
+                raise click.ClickException(f"map filename collision: refusing to overwrite {dest}")
+        # Exclude provenance and derived data: repackaged identical authored
+        # maps should have the same content fingerprint. This records duplicate
+        # candidates without silently removing either source's maps or tags.
+        raw = doc.to_dict()
+        content = {key: raw[key] for key in
+                   ("vertices", "sectors", "linedefs", "sidedefs", "things")}
+        content["format"] = doc.meta.format
+        content["udmf_namespace"] = doc.extra.get("udmf_namespace")
+        content["udmf_globals"] = doc.extra.get("udmf_globals")
+        content_hash = hashlib.sha256(json.dumps(
+            content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        entries.append({"map_name": doc.meta.map_name, "path": dest.name,
+                        "format": doc.meta.format, "content_hash": content_hash})
+    manifest_dir = out / ".manifests"
+    manifest_path = manifest_dir / f"{wad.hash}.json"
+    # --map is an incremental extraction, so keep previous manifest entries.
+    by_name = {}
+    if manifest_path.exists():
+        try:
+            previous = json.loads(manifest_path.read_text())
+            if previous["wad_hash"] != wad.hash or previous["version"] != 1:
+                raise ValueError("manifest identity/version mismatch")
+            by_name = {entry["map_name"]: entry for entry in previous["maps"]}
+        except (ValueError, KeyError, TypeError) as exc:
+            raise click.ClickException(f"invalid extraction manifest {manifest_path}: {exc}") from exc
+    by_name.update({entry["map_name"]: entry for entry in entries})
+    manifest = {"version": 1, "wad_hash": wad.hash, "source_wad": str(wad_path),
+                "maps": sorted(by_name.values(), key=lambda entry: entry["map_name"])}
+    # Preflight the complete batch before writing any map documents.
+    for doc, entry in zip(maps, entries):
+        dest = out / entry["path"]
+        _write_if_changed(dest, _to_json(doc))
         click.echo(f"wrote {dest}")
+    manifest_dir.mkdir(exist_ok=True)
+    _write_if_changed(manifest_path, _to_json(manifest))
     tex_dest = out / f"{wad.hash}.textures.json"
-    tex_dest.write_text(_to_json(texture_set))
+    _write_if_changed(tex_dest, _to_json(texture_set))
     click.echo(f"wrote {tex_dest}")
 
     # Raw pixel/palette/colormap bytes are kept out of the JSON (they're

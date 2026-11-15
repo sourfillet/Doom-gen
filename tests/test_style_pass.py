@@ -155,7 +155,8 @@ def _reachable_sectors(doc):
 
 
 def test_placed_things_clear_walls_and_stay_reachable(tmp_path):
-    from generation.style import _THING_WALL_MARGIN, _wall_clearance
+    from generation.style import _wall_clearance
+    from generation.actors import actor_profile, placement_margin
 
     style = _forced_style(tmp_path)          # inflated densities -> things get placed
     doc = _generated_doc(tmp_path)
@@ -171,8 +172,11 @@ def test_placed_things_clear_walls_and_stay_reachable(tmp_path):
     for t in placed:
         sec = _sector_containing(t.x, t.y, doc.sectors, polys, doc.vertices)
         assert sec in reached, f"thing in unreachable sector {sec}"
-        ring = [vpos[v] for v in polys[sec] if v in vpos]
-        assert _wall_clearance(t.x, t.y, ring) >= _THING_WALL_MARGIN - 1e-6
+        solid = [line for line in doc.linedefs if line.left_sidedef == -1 or line.flags.impassable]
+        profile = actor_profile(t.type)
+        clearance = profile.radius if profile.solid else placement_margin(t.type)
+        assert all(_wall_clearance(t.x, t.y, [vpos[line.v1], vpos[line.v2]])
+                   >= clearance - 1e-6 for line in solid)
 
 
 def test_placement_respects_teleporter_reachability(tmp_path):
@@ -183,7 +187,7 @@ def test_placement_respects_teleporter_reachability(tmp_path):
 
     style = _forced_style(tmp_path)
     vec = vectorize(_two_island_raster(), coarse_factor=2)
-    validate_and_repair(vec)
+    validate_and_repair(vec, reconnect=True)
     assert any(ld.special in _TELEPORT_LINE_SPECIALS for ld in vec.linedefs), \
         "precondition: validator should have inserted a teleporter"
 
@@ -320,11 +324,11 @@ def _two_island_raster(res=128):
 
 def test_teleporter_reconnects_islands():
     vec = vectorize(_two_island_raster(), coarse_factor=2)
-    repairs = validate_and_repair(vec)
+    repairs = validate_and_repair(vec, reconnect=True)
     assert any("teleporter" in r for r in repairs), repairs
     assert not any("remain disconnected" in r for r in repairs), repairs
     ports = [ld for ld in vec.linedefs if ld.special == 97]
-    assert len(ports) == 2                     # outbound + return
+    assert len(ports) == 8                     # four entry edges on each dedicated pad
     dests = [t for t in vec.things if t.type == 14]
     assert len(dests) == 2
     # tags pair up: each teleport line's tag matches a tagged sector
@@ -333,11 +337,11 @@ def test_teleporter_reconnects_islands():
 
     # every destination lands solidly inside a sector, well off the walls -
     # otherwise the player teleports into the void (HOM) or wedged in geometry
-    from generation.validator import _edge_clearance
+    from wad_parser.geometry import edge_clearance
     polys = vec.derived.sector_polygons
     vpos = {v.id: (v.x, v.y) for v in vec.vertices}
     for d in dests:
         sec = _sector_containing(d.x, d.y, vec.sectors, polys, vec.vertices)
         assert sec is not None, "teleport dest dropped into the void"
         ring = [vpos[v] for v in polys[sec] if v in vpos]
-        assert _edge_clearance(d.x, d.y, ring) >= 16   # min player radius
+        assert edge_clearance(d.x, d.y, ring) >= 16   # min player radius

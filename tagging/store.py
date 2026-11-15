@@ -1,7 +1,7 @@
 """WAD-level and per-map tag assignment storage with inheritance.
 
-Layout (see plan/tagging.md - keyed by WAD hash so re-tagging never
-requires re-parsing and re-parsing never touches tags):
+Layout (keyed by WAD hash so re-tagging never requires re-parsing and
+re-parsing never touches tags):
 
     <tags_dir>/registry.json          (owned by tagging.registry)
     <tags_dir>/<wad_hash>.wad.json
@@ -25,18 +25,18 @@ name), always outranked by user assignments, and vetoable via a per-scope
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
-from tagging.registry import Registry, canonicalize
+from tagging.registry import Registry, _write_json, canonicalize
 
 SCHEMA_VERSION = "1.0"
 
 
-def _write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2))
-    tmp.replace(path)
+def _validate_weight(weight: float) -> float:
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight < 0:
+        raise ValueError(f"tag weight must be a finite non-negative number, got {weight!r}")
+    return float(weight)
 
 
 class TagStore:
@@ -62,7 +62,7 @@ class TagStore:
 
     def _load(self, path: Path, default: dict) -> dict:
         if path.exists():
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         return dict(default)
 
     def wad_record(self, wad_hash: str) -> dict:
@@ -87,6 +87,7 @@ class TagStore:
 
     def tag_wad(self, wad_hash: str, tag: str, weight: float = 1.0,
                 wad_name: str | None = None) -> str:
+        weight = _validate_weight(weight)
         canon = self.registry.ensure(tag)
         rec = self.wad_record(wad_hash)
         if wad_name:
@@ -99,13 +100,19 @@ class TagStore:
 
     def untag_wad(self, wad_hash: str, tag: str) -> bool:
         canon = canonicalize(tag)
+        path = self._wad_path(wad_hash)
+        if not path.exists():
+            return False
         rec = self.wad_record(wad_hash)
         before = len(rec["tags"])
         rec["tags"] = [a for a in rec["tags"] if a["tag"] != canon]
-        _write_json(self._wad_path(wad_hash), rec)
-        return len(rec["tags"]) < before
+        if len(rec["tags"]) < before:
+            _write_json(path, rec)
+            return True
+        return False
 
     def tag_map(self, wad_hash: str, map_name: str, tag: str, weight: float = 1.0) -> str:
+        weight = _validate_weight(weight)
         canon = self.registry.ensure(tag)
         rec = self.map_record(wad_hash, map_name)
         assignments = {a["tag"]: a for a in rec["tags"]}
@@ -116,11 +123,16 @@ class TagStore:
 
     def untag_map(self, wad_hash: str, map_name: str, tag: str) -> bool:
         canon = canonicalize(tag)
+        path = self._map_path(wad_hash, map_name)
+        if not path.exists():
+            return False
         rec = self.map_record(wad_hash, map_name)
         before = len(rec["tags"])
         rec["tags"] = [a for a in rec["tags"] if a["tag"] != canon]
-        _write_json(self._map_path(wad_hash, map_name), rec)
-        return len(rec["tags"]) < before
+        if len(rec["tags"]) < before:
+            _write_json(path, rec)
+            return True
+        return False
 
     # -- inheritance exclusion ----------------------------------------------
 
@@ -130,13 +142,18 @@ class TagStore:
         if canon not in rec["excluded_inherited"]:
             rec["excluded_inherited"].append(canon)
             rec["excluded_inherited"].sort()
-        _write_json(self._map_path(wad_hash, map_name), rec)
+            _write_json(self._map_path(wad_hash, map_name), rec)
 
     def include_inherited(self, wad_hash: str, map_name: str, tag: str) -> None:
         canon = canonicalize(tag)
+        path = self._map_path(wad_hash, map_name)
+        if not path.exists():
+            return
         rec = self.map_record(wad_hash, map_name)
-        rec["excluded_inherited"] = [t for t in rec["excluded_inherited"] if t != canon]
-        _write_json(self._map_path(wad_hash, map_name), rec)
+        updated = [t for t in rec["excluded_inherited"] if t != canon]
+        if len(updated) != len(rec["excluded_inherited"]):
+            rec["excluded_inherited"] = updated
+            _write_json(path, rec)
 
     # -- auto-derived layer ----------------------------------------------------
 
@@ -145,17 +162,27 @@ class TagStore:
                    descriptions: dict[str, str] | None = None) -> None:
         """Replaces the WAD's entire auto layer (stale auto files for maps
         no longer present are removed - it's derived data)."""
-        for tag in set(wad_tags) | {t for m in per_map.values() for t in m}:
+        canon_wad = {canonicalize(t): _validate_weight(w) for t, w in wad_tags.items()}
+        canon_maps = {
+            map_name: {canonicalize(t): _validate_weight(w) for t, w in tags.items()}
+            for map_name, tags in per_map.items()
+        }
+        canon_desc = {canonicalize(k): v for k, v in (descriptions or {}).items()}
+        added_any = False
+        for tag in sorted(set(canon_wad) | {t for m in canon_maps.values() for t in m}):
             if tag not in self.registry:
-                self.registry.ensure(tag, (descriptions or {}).get(tag, "[auto]"))
+                self.registry.ensure(tag, canon_desc.get(tag, "[auto]"), save=False)
+                added_any = True
+        if added_any:
+            self.registry.save()
         _write_json(self._wad_auto_path(wad_hash), {
             "schema_version": SCHEMA_VERSION, "wad_hash": wad_hash,
-            "tags": [{"tag": t, "weight": w} for t, w in sorted(wad_tags.items())],
+            "tags": [{"tag": t, "weight": w} for t, w in sorted(canon_wad.items())],
         })
         wad_dir = self.root / wad_hash
         for stale in wad_dir.glob("*.auto.json") if wad_dir.is_dir() else []:
             stale.unlink()
-        for map_name, tags in per_map.items():
+        for map_name, tags in canon_maps.items():
             if tags:
                 _write_json(self._map_auto_path(wad_hash, map_name), {
                     "schema_version": SCHEMA_VERSION,
@@ -184,7 +211,21 @@ class TagStore:
             path = self._map_path(wad_hash, map_name)
         if canon not in rec["denied_auto"]:
             rec["denied_auto"] = sorted(rec["denied_auto"] + [canon])
-        _write_json(path, rec)
+            _write_json(path, rec)
+
+    def allow_auto(self, wad_hash: str, tag: str, map_name: str | None = None) -> bool:
+        """Clear a prior deny_auto veto."""
+        canon = canonicalize(tag)
+        path = self._wad_path(wad_hash) if map_name is None else self._map_path(wad_hash, map_name)
+        if not path.exists():
+            return False
+        rec = self.wad_record(wad_hash) if map_name is None else self.map_record(wad_hash, map_name)
+        updated = [t for t in rec["denied_auto"] if t != canon]
+        if len(updated) != len(rec["denied_auto"]):
+            rec["denied_auto"] = updated
+            _write_json(path, rec)
+            return True
+        return False
 
     # -- resolution ----------------------------------------------------------
 
@@ -226,6 +267,8 @@ class TagStore:
         """User assignment files only - the .auto.json layer is derived
         data, deliberately untouched by rename/merge (regenerating it would
         just recreate the rule's canonical name anyway)."""
+        if not self.root.exists():
+            return
         yield from self.root.glob("*.wad.json")
         for sub in self.root.iterdir():
             if sub.is_dir():
@@ -237,9 +280,11 @@ class TagStore:
         """Rewrites every assignment file, folding old into new. On
         collision the existing new-tag assignment wins (its weight is what
         the user chose knowing both tags existed)."""
+        if old_canon == new_canon:
+            return 0
         touched = 0
         for path in self._iter_assignment_files():
-            rec = json.loads(path.read_text())
+            rec = json.loads(path.read_text(encoding="utf-8"))
             changed = False
             assignments = {a["tag"]: a for a in rec.get("tags", [])}
             if old_canon in assignments:
@@ -269,10 +314,21 @@ class TagStore:
 
     # -- corpus stats (registry list, suggestion ranking) ---------------------
 
-    def tag_usage(self) -> dict[str, int]:
+    def tag_usage(self, *, include_auto: bool = False) -> dict[str, int]:
         counts: dict[str, int] = {}
         for path in self._iter_assignment_files():
-            rec = json.loads(path.read_text())
+            rec = json.loads(path.read_text(encoding="utf-8"))
             for a in rec.get("tags", []):
                 counts[a["tag"]] = counts.get(a["tag"], 0) + 1
+        if include_auto and self.root.exists():
+            for auto_path in self.root.glob("*.wad.auto.json"):
+                wad_hash = auto_path.name[:-len(".wad.auto.json")]
+                for tag in self.wad_auto_tags(wad_hash):
+                    counts[tag] = counts.get(tag, 0) + 1
+            for sub in self.root.iterdir():
+                if sub.is_dir():
+                    for auto_path in sub.glob("*.auto.json"):
+                        map_name = auto_path.name[:-len(".auto.json")]
+                        for tag in self.map_auto_tags(sub.name, map_name):
+                            counts[tag] = counts.get(tag, 0) + 1
         return counts

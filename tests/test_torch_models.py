@@ -50,6 +50,23 @@ def test_conditioner_registers_and_encodes():
     assert torch.all(unknown == 0)
 
 
+@pytest.mark.parametrize("scale,epsilon", [(0.0, 0.0), (1.0, 0.1), (2.0, 0.2)])
+def test_guidance_endpoints(scale, epsilon, monkeypatch):
+    from models.layout.diffusion import GaussianDiffusion
+
+    class KnownNoise(torch.nn.Module):
+        def forward(self, x, t, cond):
+            return torch.zeros_like(x) + cond[:, :1, None, None]
+
+    diffusion = GaussianDiffusion(KnownNoise(), timesteps=10)
+    monkeypatch.setattr(torch, "randn", lambda shape, **kw: torch.full(shape, 0.25))
+    result = diffusion.ddim_sample((1, 1, 2, 2), torch.tensor([[0.1]]),
+                                   torch.tensor([[0.0]]), steps=1, guidance=scale)
+    ac = diffusion.alphas_cumprod[-1]
+    expected = ((0.25 - (1 - ac).sqrt() * epsilon) / ac.sqrt()).clamp(-1, 1)
+    assert torch.allclose(result, expected.expand_as(result))
+
+
 def test_conditioner_cfg_dropout_gives_null():
     from models.conditioning import TagConditioner
     cond = TagConditioner(embed_dim=16, max_tags=4)

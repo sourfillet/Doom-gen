@@ -41,6 +41,7 @@ class GameProfile:
     texture_use: Counter = field(default_factory=Counter)
     flat_use: Counter = field(default_factory=Counter)
     thing_use: Counter = field(default_factory=Counter)
+    wad_path: str | None = None
 
     # -- construction --------------------------------------------------------
 
@@ -57,7 +58,7 @@ class GameProfile:
             animated=wad.get_lump("ANIMATED"),
             switches=wad.get_lump("SWITCHES"),
         )
-        prof = cls(name=name or Path(wad_path).stem.upper())
+        prof = cls(name=name or Path(wad_path).stem.upper(), wad_path=str(wad_path))
         prof.textures = {t.upper() for t in tex_set.textures}
         prof.flats = {a.name.upper() for a in tex_set.flats}
         for doc in extract_all_maps(wad):
@@ -144,17 +145,53 @@ class GameProfile:
                 if new != old:
                     tex_fixed += 1
                     setattr(sd, attr, new)
+        from generation.actors import actor_profile, spawn_problem
+        from wad_parser.clearance import MapClearance
+        from wad_parser.traversal import component_distances
+
         kept = []
         dropped = 0
+        geometry = None
+        reachable = None
         for t in doc.things:
-            new_type = self.sub_thing(t.type)
-            if new_type is None:
+            if t.type in self.thing_types or t.type in _ESSENTIAL_THINGS:
+                kept.append(t)
+                continue
+            category = resolve_doomed(t.type)[1]
+            same = sorted(
+                (cand for cand in self.thing_use if resolve_doomed(cand)[1] == category),
+                key=lambda cand: (self.thing_use[cand], -cand),
+                reverse=True,
+            )
+            if not same:
                 dropped += 1
                 continue
-            if new_type != t.type:
-                thing_fixed += 1
-                t.type = new_type
-                t.type_name, t.category, t.unresolved = resolve_doomed(new_type)
+            old_prof = actor_profile(t.type)
+            chosen = None
+            for cand in same:
+                new_prof = actor_profile(cand)
+                if (
+                    old_prof is not None
+                    and new_prof is not None
+                    and new_prof.radius <= old_prof.radius
+                    and new_prof.height <= old_prof.height
+                    and (not new_prof.solid or old_prof.solid)
+                ):
+                    chosen = cand
+                    break
+                if geometry is None:
+                    geometry = MapClearance(doc.vertices, doc.sectors, doc.linedefs, doc.sidedefs)
+                    reachable = component_distances(doc)
+                if spawn_problem(doc, cand, t.x, t.y, ignore_id=t.id,
+                                 reachable=reachable, geometry=geometry) is None:
+                    chosen = cand
+                    break
+            if chosen is None:
+                dropped += 1
+                continue
+            thing_fixed += 1
+            t.type = chosen
+            t.type_name, t.category, t.unresolved = resolve_doomed(chosen)
             kept.append(t)
         for i, t in enumerate(kept):
             t.id = i
@@ -189,11 +226,11 @@ class GameProfile:
         )
 
     def save(self, path: Path | str) -> None:
-        Path(path).write_text(json.dumps(self.to_json(), indent=2))
+        Path(path).write_text(json.dumps(self.to_json(), indent=2), encoding="utf-8")
 
     @classmethod
     def load(cls, path: Path | str) -> "GameProfile":
-        return cls.from_json(json.loads(Path(path).read_text()))
+        return cls.from_json(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 def load_profile(path_or_wad: Path | str | None) -> GameProfile | None:

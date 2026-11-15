@@ -3,8 +3,8 @@ ports (Eternity) and ZDoom/GZDoom instead of the binary Doom/Hexen lumps.
 
 UDMF's defining feature is that any block can carry arbitrary named fields —
 that's exactly the kind of richer data (vertex-based sector slopes, 3D floors
-via control-sector specials, port-specific extensions) plan/data-model.md
-calls out as needing to be represented rather than dropped. Every field is
+via control-sector specials, port-specific extensions) that must be
+represented rather than dropped. Every field is
 parsed into a raw dict first; a fixed set of well-known field names then maps
 onto the same typed schema the binary parser produces, and anything left over
 goes into each object's `extra` dict.

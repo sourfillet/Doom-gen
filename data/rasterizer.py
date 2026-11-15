@@ -1,5 +1,4 @@
-"""Map document -> multi-channel top-down raster (plan/generation.md,
-Stage 1).
+"""Map document -> multi-channel top-down raster (Stage 1).
 
 Channel layout (all float32 in [0, 1]):
     0  wall mask            one-sided linedefs
@@ -8,30 +7,34 @@ Channel layout (all float32 in [0, 1]):
     3  ceiling height       map-relative
     4  ceiling height       absolute / 1024, clipped
     5  light level          /255
-    6  sector-ID coloring   (id+1)/n_sectors - topology hint, not a value
+    6  sector boundary      ordering-independent linedef boundary mask
     7  linedef special density   line-rasterized specials, max-normalized
     8  thing density             cell counts, max-normalized
     9  occupancy                 binary 1=sector here, 0=void - the explicit
                                  negative-space target so the model learns
                                  rooms-in-void instead of filling the canvas
+    10..15 semantic masks        specials 11,51,52,124,1,31 respectively
+    16..19 grid faces            east/south boundary, east/south solid wall
 
 Two height encodings are kept because both matter: the model needs the
 map's internal shape (relative) AND real-world scale (absolute - an 8-unit
-step is a stair, a 64-unit step is a wall; see plan/data-model.md on why
-normalized coordinates never replace raw ones).
+step is a stair, a 64-unit step is a wall), so normalized coordinates
+never replace raw ones.
 
-Sectors are painted largest-bounding-box-first so nested sectors overwrite
-their containers - a consequence of sector polygons being single boundary
-rings (holes are not subtracted; documented simplification in the derived
-layer).
+Every sector is filled using all reconstructed rings with even/odd parity,
+so holes stay empty and disconnected islands retain their ownership.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from wad_parser.types import MapDocument
+from wad_parser.geometry import sector_points
 
-N_CHANNELS = 10
+SEMANTIC_SPECIALS = (11, 51, 52, 124, 1, 31)
+SEMANTIC_END = 10 + len(SEMANTIC_SPECIALS)
+N_CHANNELS = SEMANTIC_END + 4
+RASTER_VERSION = 5
 OCCUPANCY_CHANNEL = 9
 ABS_HEIGHT_SCALE = 1024.0
 
@@ -75,8 +78,8 @@ def _fill_polygon(mask_shape, cols, rows):
         x1, y1 = cols[i], rows[i]
         x2, y2 = cols[(i + 1) % n], rows[(i + 1) % n]
         crosses = (y1 > gr) != (y2 > gr)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            x_at = (x2 - x1) * (gr - y1) / (y2 - y1 + 1e-12) + x1
+        dy = np.where(crosses, y2 - y1, 1.0)
+        x_at = (x2 - x1) * (gr - y1) / dy + x1
         inside ^= crosses & (gc < x_at)
     rr, cc = np.nonzero(inside)
     return rr + min_r, cc + min_c
@@ -96,11 +99,14 @@ def _draw_line(channel: np.ndarray, c1, r1, c2, r2, value: float = 1.0, accumula
         channel[rows, cols] = value
 
 
-def rasterize(doc: MapDocument, resolution: int = 128) -> tuple[np.ndarray, dict]:
-    """Returns (raster (9, R, R) float32, meta dict with the world<->grid
+def rasterize(doc: MapDocument, resolution: int = 128, *, raster_version=RASTER_VERSION) -> tuple[np.ndarray, dict]:
+    """Returns (raster (N_CHANNELS, R, R) float32, meta with the world<->grid
     transform and height-normalization constants for invertibility)."""
     to_grid, meta = _grid_transform(doc, resolution)
-    raster = np.zeros((N_CHANNELS, resolution, resolution), dtype=np.float32)
+    channels = N_CHANNELS if raster_version >= 5 else SEMANTIC_END if raster_version >= 4 else 10
+    raster = np.zeros((channels, resolution, resolution), dtype=np.float32)
+    ownership = np.full((resolution, resolution), -1, dtype=np.int64)
+    meta['raster_version'] = raster_version
 
     vpos = {v.id: (v.x, v.y) for v in doc.vertices}
 
@@ -112,23 +118,25 @@ def rasterize(doc: MapDocument, resolution: int = 128) -> tuple[np.ndarray, dict
                  "ceil_min": c_min, "ceil_max": c_max})
     f_span = max(f_max - f_min, 1)
     c_span = max(c_max - c_min, 1)
-    n_sectors = max(len(doc.sectors), 1)
 
-    # --- sector-area channels (1-6), nested sectors painted last ---
+    # --- sector-area channels (1-6), XOR all rings to subtract holes ---
     order = []
     for s in doc.sectors:
-        ring = (doc.derived.sector_polygons[s.id]
-                if s.id < len(doc.derived.sector_polygons) else [])
-        pts = np.array([vpos[v] for v in ring if v in vpos], dtype=np.float64)
-        if len(pts) < 3:
+        rings = [np.array(points, dtype=np.float64) for points in sector_points(doc, s.id)]
+        if not rings:
             continue
+        pts = np.concatenate(rings)
         bbox_area = float(np.ptp(pts[:, 0]) * np.ptp(pts[:, 1]))
-        order.append((bbox_area, s, pts))
+        order.append((bbox_area, s, rings))
     order.sort(key=lambda t: -t[0])
 
-    for _, s, pts in order:
-        cols, rows = to_grid(pts[:, 0], pts[:, 1])
-        rr, cc = _fill_polygon((resolution, resolution), cols, rows)
+    for _, s, rings in order:
+        mask = np.zeros((resolution, resolution), dtype=bool)
+        for pts in rings:
+            cols, rows = to_grid(pts[:, 0], pts[:, 1])
+            rr, cc = _fill_polygon((resolution, resolution), cols, rows)
+            mask[rr, cc] ^= True
+        rr, cc = np.nonzero(mask)
         if len(rr) == 0:
             continue
         raster[1, rr, cc] = (s.floor_height - f_min) / f_span
@@ -136,8 +144,8 @@ def rasterize(doc: MapDocument, resolution: int = 128) -> tuple[np.ndarray, dict
         raster[3, rr, cc] = (s.ceil_height - c_min) / c_span
         raster[4, rr, cc] = np.clip(s.ceil_height / ABS_HEIGHT_SCALE, -1, 1) * 0.5 + 0.5
         raster[5, rr, cc] = np.clip(s.light_level, 0, 255) / 255.0
-        raster[6, rr, cc] = (s.id + 1) / n_sectors
         raster[OCCUPANCY_CHANNEL, rr, cc] = 1.0   # negative-space target
+        ownership[rr, cc] = s.id
 
     # --- line channels (0, 7) ---
     for ld in doc.linedefs:
@@ -146,7 +154,14 @@ def rasterize(doc: MapDocument, resolution: int = 128) -> tuple[np.ndarray, dict
         (x1, y1), (x2, y2) = vpos[ld.v1], vpos[ld.v2]
         c1, r1 = to_grid(x1, y1)
         c2, r2 = to_grid(x2, y2)
-        if ld.left_sidedef == -1:
+        if raster_version >= 4 and ld.special in SEMANTIC_SPECIALS:
+            _draw_line(raster[10 + SEMANTIC_SPECIALS.index(ld.special)], c1, r1, c2, r2)
+        right = doc.sidedefs[ld.right_sidedef].sector if 0 <= ld.right_sidedef < len(doc.sidedefs) else None
+        left = doc.sidedefs[ld.left_sidedef].sector if 0 <= ld.left_sidedef < len(doc.sidedefs) else None
+        if right != left:
+            _draw_line(raster[6], c1, r1, c2, r2)
+        if (ld.left_sidedef < 0 or ld.right_sidedef < 0 or ld.flags.impassable
+                or ld.flags.block_players or ld.flags.block_everything):
             _draw_line(raster[0], c1, r1, c2, r2)
         if ld.special:
             _draw_line(raster[7], c1, r1, c2, r2, accumulate=True)
@@ -160,5 +175,43 @@ def rasterize(doc: MapDocument, resolution: int = 128) -> tuple[np.ndarray, dict
         raster[8, ri, ci] += 1.0
     if raster[8].max() > 0:
         raster[8] /= raster[8].max()
+
+    if raster_version >= 5:
+        from shapely import STRtree, LineString, linestrings, intersection, line_locate_point, get_type_id
+        blocker_specs: list[tuple[LineString, float, float]] = []
+        for line in doc.linedefs:
+            if (line.left_sidedef < 0 or line.right_sidedef < 0 or line.flags.impassable
+                    or line.flags.block_players or line.flags.block_everything):
+                if line.v1 in vpos and line.v2 in vpos:
+                    a, b = vpos[line.v1], vpos[line.v2]
+                    ca, ra = float(to_grid(*a)[0]), float(to_grid(*a)[1])
+                    cb, rb = float(to_grid(*b)[0]), float(to_grid(*b)[1])
+                    if abs(cb - ca) > 1e-9 or abs(rb - ra) > 1e-9:
+                        blocker_specs.append((LineString([(ca, ra), (cb, rb)]), cb - ca, rb - ra))
+        for axis, (dr, dc) in enumerate(((0, 1), (1, 0))):
+            # Exclude segments parallel/collinear with the face-crossing ray:
+            # a vertical wall separates east/west, not north/south.
+            axis_blockers = [geom for geom, dx, dy in blocker_specs if abs(dx * dr - dy * dc) > 1e-9]
+            tree = STRtree(axis_blockers)
+            h, w = resolution - dr, resolution - dc
+            rows, cols = np.indices((h, w))
+            first = np.stack([cols.ravel() + 0.5, rows.ravel() + 0.5], axis=-1)
+            second = first + np.array([dc, dr])
+            rays = linestrings(np.stack([first, second], axis=1))
+            solid = np.zeros(h * w, dtype=bool)
+            hits = tree.query(rays, predicate='intersects')
+            if hits.size:
+                ray_ids, line_ids = hits
+                touched = intersection(rays[ray_ids], np.array(axis_blockers, dtype=object)[line_ids])
+                # A half-open face convention assigns a wall through a pixel
+                # centre to one edge, avoiding two parallel cuts/sliver cells.
+                points = get_type_id(touched) == 0
+                distances = np.zeros(len(ray_ids))
+                distances[points] = line_locate_point(rays[ray_ids[points]], touched[points])
+                solid[ray_ids[(~points) | (distances > 1e-7)]] = True
+            solid = solid.reshape(h, w)
+            boundary = ownership[:h, :w] != ownership[dr:dr + h, dc:dc + w]
+            raster[16 + axis, :h, :w] = boundary | solid
+            raster[18 + axis, :h, :w] = solid
 
     return raster, meta

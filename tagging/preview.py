@@ -1,10 +1,12 @@
 """Lightweight top-down SVG preview of a parsed map, for the tagging CLI.
 
-Line art only, per plan/tagging.md - one-sided walls dark, two-sided
+Line art only: one-sided walls dark, two-sided
 (passable) lines light, things as category-colored dots. SVG because it
 needs zero dependencies and opens in any browser/editor.
 """
 from __future__ import annotations
+
+import html
 
 from wad_parser.types import MapDocument
 
@@ -27,7 +29,7 @@ def map_to_svg(doc: MapDocument, width: int = 1024) -> str:
     span_x = max(b.max_x - b.min_x, 1.0)
     span_y = max(b.max_y - b.min_y, 1.0)
     margin = 0.03 * max(span_x, span_y)
-    height = int(width * (span_y + 2 * margin) / (span_x + 2 * margin))
+    height = max(1, round(width * (span_y + 2 * margin) / (span_x + 2 * margin)))
 
     def sx(x: float) -> float:
         return (x - b.min_x + margin) / (span_x + 2 * margin) * width
@@ -43,7 +45,7 @@ def map_to_svg(doc: MapDocument, width: int = 1024) -> str:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">',
         f'<rect width="{width}" height="{height}" fill="#14161a"/>',
-        f'<title>{doc.meta.map_name}</title>',
+        f'<title>{html.escape(doc.meta.map_name)}</title>',
     ]
 
     two_sided, one_sided, special = [], [], []
@@ -54,7 +56,7 @@ def map_to_svg(doc: MapDocument, width: int = 1024) -> str:
         seg = f'<line x1="{sx(x1):.1f}" y1="{sy(y1):.1f}" x2="{sx(x2):.1f}" y2="{sy(y2):.1f}"/>'
         if ld.special:
             special.append(seg)
-        elif ld.left_sidedef == -1:
+        elif ld.left_sidedef < 0 or ld.right_sidedef < 0:
             one_sided.append(seg)
         else:
             two_sided.append(seg)

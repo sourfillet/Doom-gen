@@ -1,10 +1,9 @@
 """Dataclasses for the extracted-map schema, plus lookup tables for DoomEd
 thing numbers and linedef specials.
 
-See plan/data-model.md for the design rationale: raw fields are never
-dropped, unrecognized data goes into an `extra` dict rather than being
-discarded, and `schema_version` lets the format grow without invalidating
-already-parsed documents.
+Design rationale: raw fields are never dropped, unrecognized data goes into
+an `extra` dict rather than being discarded, and `schema_version` lets the
+format grow without invalidating already-parsed documents.
 """
 from __future__ import annotations
 
@@ -140,6 +139,17 @@ class Thing:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+def active_single_player(thing: Thing) -> bool:
+    """Vanilla skill-3 population, matching P_SpawnMapThing's flag order.
+
+    Player starts bypass skill/mode flags. Only player 1 is present in
+    single-player; coop/deathmatch markers are not simultaneous solid actors.
+    """
+    if thing.type in {1, 2, 3, 4, 11}:
+        return thing.type == 1
+    return not thing.flags.not_single_player and thing.flags.skill_3
+
+
 # ---------------------------------------------------------------------------
 # Texture system (WAD-wide)
 # ---------------------------------------------------------------------------
@@ -231,6 +241,13 @@ class BoundingBox:
 class DerivedData:
     sector_graph: dict[str, Any] = field(default_factory=dict)
     sector_polygons: list[list[int]] = field(default_factory=list)
+    sector_rings: list[list[list[int]]] = field(default_factory=list)
+    sector_regions: list[list[list[tuple[float, float]]]] = field(default_factory=list)
+    raw_geometry_issues: list[str] = field(default_factory=list)
+    bsp_geometry: Optional[dict[str, Any]] = None
+    geometry_issues: list[str] = field(default_factory=list)
+    derived_version: int = 0
+    traversal_version: int = 0
     trigger_map: dict[str, list[int]] = field(default_factory=dict)
     reachable_from_start: list[int] = field(default_factory=list)
     texture_alignment_score: Optional[float] = None
@@ -270,7 +287,7 @@ class MapDocument:
         meta_d = dict(data["meta"])
         mapinfo = meta_d.get("mapinfo")
         meta_d["mapinfo"] = _build(MapInfoEntry, mapinfo) if mapinfo else None
-        return cls(
+        doc = cls(
             schema_version=data["schema_version"],
             meta=_build(MapMeta, meta_d),
             bounds=_build(BoundingBox, data["bounds"]),
@@ -282,6 +299,18 @@ class MapDocument:
             derived=_build(DerivedData, data["derived"]),
             extra=data.get("extra", {}),
         )
+        from wad_parser.geometry import DERIVED_VERSION
+        from wad_parser.traversal import TRAVERSAL_VERSION
+        if (doc.derived.derived_version != DERIVED_VERSION
+                or doc.derived.traversal_version != TRAVERSAL_VERSION):
+            from wad_parser.map_extractor import compute_derived
+            ns = str(doc.extra.get("udmf_namespace", "")).lower()
+            doc.bounds, doc.derived = compute_derived(
+                doc.vertices, doc.sectors, doc.linedefs, doc.sidedefs, doc.things,
+                hexen_style=doc.meta.format == "hexen" or ns in HEXEN_UDMF_NAMESPACES,
+                region_geometry=doc.derived.sector_regions or None,
+                region_info=doc.derived.bsp_geometry)
+        return doc
 
 
 def _build(cls, d: dict):

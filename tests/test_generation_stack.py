@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wad_builder import build_hexen_wad, build_two_sector_wad
 
 from data.rasterizer import rasterize
-from generation.pipeline import raster_to_document, regenerate_from_json
+from generation.pipeline import regenerate_from_json
 from generation.validator import validate_and_repair
 from generation.vectorizer import vectorize
 from wad_parser.map_extractor import extract_all_maps
@@ -132,7 +132,7 @@ def test_validator_inserts_start_and_fixes_heights(tmp_path):
     vec = vectorize(raster)
     vec.sectors[0].ceil_height = vec.sectors[0].floor_height  # crushed room
     vec.sectors[0].light_level = 0
-    repairs = validate_and_repair(vec)
+    repairs = validate_and_repair(vec, brighten=True)
     assert any("Player1Start" in r for r in repairs)
     assert any(t.type == 1 for t in vec.things)
     assert vec.sectors[0].ceil_height >= vec.sectors[0].floor_height + 56
@@ -151,7 +151,7 @@ def test_reachability_repair_lowers_cliff(tmp_path):
     doc = _extract(tmp_path)
     doc.sectors[1].floor_height = 200
     doc.sectors[1].ceil_height = 328
-    repairs = validate_and_repair(doc)
+    repairs = validate_and_repair(doc, repair_steps=True)
     assert any("traversable" in r for r in repairs)
     assert doc.sectors[1].floor_height - doc.sectors[0].floor_height <= 24
     assert doc.sectors[1].ceil_height - doc.sectors[1].floor_height == 128

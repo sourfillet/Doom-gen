@@ -1,16 +1,7 @@
-"""Stage 1 training CLI: layout diffusion over an extracted corpus.
-
-    train-layout --maps-dir dataset/maps --tags-dir tags --out checkpoints/
-
-Rasters (plus mirror/rotate variants when --augment) are precomputed into
-one in-memory tensor pool - corpus sizes here are hundreds of maps, not
-millions of images. Tag conditioning uses CFG dropout so the model learns
-an unconditional structural prior from every map plus a conditional
-delta per tag set (plan/generation.md).
-"""
+"""Stream cached map rasters into a reproducible, validated diffusion run."""
 from __future__ import annotations
 
-import time
+import math
 from pathlib import Path
 
 import click
@@ -18,114 +9,97 @@ import numpy as np
 
 
 @click.command()
-@click.option("--maps-dir", required=True, type=click.Path(exists=True, file_okay=False))
-@click.option("--tags-dir", default=None, type=click.Path(file_okay=False),
-              help="Tag store; omitting it trains fully unconditional.")
-@click.option("--out", "out_dir", default="checkpoints", show_default=True)
-@click.option("--resolution", default=128, show_default=True)
-@click.option("--steps", default=20000, show_default=True)
-@click.option("--batch-size", default=8, show_default=True)
-@click.option("--lr", default=2e-4, show_default=True)
-@click.option("--cfg-dropout", default=0.15, show_default=True)
-@click.option("--base", default=64, show_default=True, help="U-Net base channel count.")
-@click.option("--timesteps", default=1000, show_default=True)
-@click.option("--augment/--no-augment", default=True, show_default=True)
-@click.option("--save-every", default=1000, show_default=True)
-@click.option("--resume", default=None, type=click.Path(exists=True, dir_okay=False))
-@click.option("--occupancy-weight", default=8.0, show_default=True,
-              help="Loss weight on the occupancy channel (9) so the model "
-                   "learns void/negative space rather than filling the canvas.")
-def main(maps_dir, tags_dir, out_dir, resolution, steps, batch_size, lr,
-         cfg_dropout, base, timesteps, augment, save_every, resume,
-         occupancy_weight) -> None:
+@click.option('--maps-dir', required=True, type=click.Path(exists=True, file_okay=False))
+@click.option('--tags-dir', default=None, type=click.Path(file_okay=False))
+@click.option('--out', 'out_dir', default='checkpoints')
+@click.option('--manifest', default=None, type=click.Path(exists=True, dir_okay=False))
+@click.option('--seed', default=0, type=int)
+@click.option('--device', default=None)
+@click.option('--resolution', default=128, type=click.IntRange(min=8))
+@click.option('--steps', default=20000, type=click.IntRange(min=1), help='Total optimizer steps, including resume.')
+@click.option('--batch-size', default=8, type=click.IntRange(min=1))
+@click.option('--lr', default=2e-4, type=click.FloatRange(min=0, min_open=True))
+@click.option('--cfg-dropout', default=0.15, type=click.FloatRange(0, 1))
+@click.option('--base', default=64, type=click.IntRange(min=8))
+@click.option('--timesteps', default=1000, type=click.IntRange(min=2))
+@click.option('--augment/--no-augment', default=True)
+@click.option('--save-every', default=1000, type=click.IntRange(min=1))
+@click.option('--validate-every', default=1000, type=click.IntRange(min=1))
+@click.option('--resume', default=None, type=click.Path(exists=True, dir_okay=False))
+@click.option('--occupancy-weight', default=8.0, type=click.FloatRange(min=0, min_open=True))
+def main(maps_dir, tags_dir, out_dir, manifest, seed, device, resolution, steps,
+         batch_size, lr, cfg_dropout, base, timesteps, augment, save_every,
+         validate_every, resume, occupancy_weight):
     import torch
-
     from data.augmentation import AUGMENT_OPS
-    from data.rasterizer import OCCUPANCY_CHANNEL
+    from data.corpus import training_split
     from data.dataset import MapDataset
-    from models.checkpoint import load_checkpoint, save_checkpoint
+    from data.rasterizer import N_CHANNELS, OCCUPANCY_CHANNEL, RASTER_VERSION
+    from data.raster_cache import RasterCache
     from models.conditioning import TagConditioner
     from models.layout.diffusion import GaussianDiffusion
     from models.layout.unet import UNet
+    from models.training import fit, load_resume, seed_all
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    click.echo(f"device: {device}")
-
-    ds = MapDataset(maps_dir, tags_dir=tags_dir, resolution=resolution)
-    if len(ds) == 0:
-        raise click.ClickException(f"no map JSON found in {maps_dir}")
-
-    from data.rasterizer import N_CHANNELS
-
-    ops = [None] + (list(AUGMENT_OPS) if augment else [])
-    click.echo(f"precomputing rasters for {len(ds)} map(s)"
-               f"{' x ' + str(len(ops)) + ' augmented variants' if augment else ''}...")
-    # Preallocate the pool and fill it in place; the old list->np.stack path
-    # held two full copies at once (~2x peak RAM), which OOMs a 256px corpus
-    # on a small-RAM box.
-    pool = torch.empty((len(ds) * len(ops), N_CHANNELS, resolution, resolution),
-                       dtype=torch.float32)
-    pool_tags: list = []
-    t0 = time.time()
-    idx = 0
-    for i in range(len(ds)):
-        for op in ops:
-            sample = ds.get(i, augment_op=op)
-            pool[idx] = torch.from_numpy(sample["raster"])
-            pool_tags.append(sample["tags"])
-            idx += 1
-    pool.mul_(2).sub_(1)  # [0,1] -> [-1,1], in place
-    click.echo(f"pool: {tuple(pool.shape)} in {time.time() - t0:.0f}s")
-
-    config = {"in_channels": pool.shape[1], "base": base, "mults": [1, 2, 4],
-              "emb_dim": 256, "timesteps": timesteps, "max_tags": 512,
-              "resolution": resolution}
-
-    if resume:
-        _, diffusion, conditioner, config = load_checkpoint(resume, device)
-        diffusion.train()
-        click.echo(f"resumed from {resume}")
-    else:
-        model = UNet(in_channels=config["in_channels"], base=base,
-                     mults=(1, 2, 4), emb_dim=config["emb_dim"])
-        diffusion = GaussianDiffusion(model, timesteps=timesteps).to(device)
-        conditioner = TagConditioner(embed_dim=config["emb_dim"],
-                                     max_tags=config["max_tags"]).to(device)
-
-    params = list(diffusion.parameters()) + list(conditioner.parameters())
-    opt = torch.optim.AdamW(params, lr=lr)
-    n_params = sum(p.numel() for p in diffusion.parameters())
-    click.echo(f"U-Net parameters: {n_params / 1e6:.1f}M")
-
-    channel_weights = torch.ones(config["in_channels"], device=device)
-    if OCCUPANCY_CHANNEL < config["in_channels"]:
-        channel_weights[OCCUPANCY_CHANNEL] = occupancy_weight
-        click.echo(f"occupancy channel {OCCUPANCY_CHANNEL} loss weight = {occupancy_weight}")
-
-    out = Path(out_dir)
-    losses = []
-    t0 = time.time()
-    for step in range(1, steps + 1):
-        idx = torch.randint(0, len(pool), (batch_size,))
-        x0 = pool[idx].to(device)
-        cond = conditioner.encode([pool_tags[i] for i in idx.tolist()], device=device,
-                                  cfg_dropout=cfg_dropout, register_new=True)
-        loss = diffusion.loss(x0, cond, channel_weights=channel_weights)
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-        losses.append(loss.item())
-        if step % 50 == 0:
-            rate = step / (time.time() - t0)
-            click.echo(f"step {step}/{steps}  loss {np.mean(losses[-50:]):.4f}  "
-                       f"{rate:.1f} it/s")
-        if step % save_every == 0 or step == steps:
-            ckpt = out / f"layout_{step:06d}.pt"
-            save_checkpoint(ckpt, diffusion, conditioner, config, step)
-            click.echo(f"saved {ckpt}")
-
-    click.echo(f"known tags: {sorted(conditioner.tag_to_index)}")
+    device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    try:
+        checkpoint = load_resume(resume, device)
+        settings = checkpoint['settings'] if checkpoint else {
+            'seed': seed, 'batch_size': batch_size, 'lr': lr, 'cfg_dropout': cfg_dropout,
+            'augment': augment, 'occupancy_weight': occupancy_weight}
+        seed_all(settings['seed'])
+        splits, corpus = training_split(maps_dir, manifest, seed=settings['seed'])
+        config = checkpoint['config'] if checkpoint else {
+            'kind': 'layout', 'in_channels': N_CHANNELS, 'base': base, 'mults': [1, 2, 4],
+            'emb_dim': 256, 'timesteps': timesteps, 'max_tags': 512,
+            'resolution': resolution, 'raster_version': RASTER_VERSION, 'numeric_dim': 1}
+        if config.get('kind') != 'layout' or config.get('raster_version') != RASTER_VERSION:
+            raise ValueError('checkpoint preprocessing is incompatible with current rasters')
+        if config['resolution'] % 4 or config['base'] % 8:
+            raise ValueError('resolution must be divisible by 4 and base channels by 8')
+        datasets = {split: MapDataset(maps_dir, tags_dir, config['resolution'], paths=paths)
+                    for split, paths in splits.items()}
+        caches = {split: RasterCache(ds, Path(out_dir) / 'rasters' / split,
+                                     corpus['fingerprint'], tags_dir) for split, ds in datasets.items()}
+        # Fit the world-scale distribution on training maps only. The same
+        # numeric condition is supplied at training and sampling.
+        if not checkpoint:
+            spans = []
+            for i in range(len(datasets['train'])):
+                metadata = caches['train'].get(i)['raster_meta']
+                spans.append(metadata['resolution'] / metadata['scale'])
+            config['world_spans'] = spans
+        diffusion = GaussianDiffusion(UNet(config['in_channels'], config['base'],
+            tuple(config['mults']), config['emb_dim']), timesteps=config['timesteps']).to(device)
+        conditioner = TagConditioner(config['emb_dim'], config['max_tags'], numeric_dim=1).to(device)
+        optimizer = torch.optim.AdamW(list(diffusion.parameters()) + list(conditioner.parameters()), lr=settings['lr'])
+        weights = torch.ones(config['in_channels'], device=device)
+        weights[OCCUPANCY_CHANNEL] = settings['occupancy_weight']
+        ops = [None] + (list(AUGMENT_OPS) if settings['augment'] else [])
+        def loss_fn(item, training):
+            split, index = item
+            indices = [index]
+            if training:
+                indices += np.random.randint(len(datasets[split]), size=settings['batch_size'] - 1).tolist()
+            samples = [caches[split].get(i, ops[np.random.randint(len(ops))] if training else None) for i in indices]
+            arrays = np.stack([sample['raster'] for sample in samples])
+            x0 = torch.from_numpy(arrays).to(device).mul(2).sub(1)
+            values = [[math.log(sample['raster_meta']['resolution'] / sample['raster_meta']['scale'] / 2048)] for sample in samples]
+            cond = conditioner.encode([sample['tags'] for sample in samples], device,
+                cfg_dropout=settings['cfg_dropout'] if training else 0, register_new=training, numeric_values=values)
+            return diffusion.loss(x0, cond, channel_weights=weights)
+        train_pool = [('train', i) for i in range(len(datasets['train']))]
+        validation_pool = [('validation', i) for i in range(len(datasets['validation']))]
+        click.echo(f"device {device}; train {len(train_pool)}, validation {len(validation_pool)}, test {len(splits['test'])}; rasters streamed from disk")
+        if not validation_pool:
+            click.echo('No independent validation families: overfit/smoke experiment only.')
+        fit(diffusion, conditioner, optimizer, train_pool, validation_pool, loss_fn,
+            config=config, settings=settings, manifest=corpus, out_dir=out_dir,
+            steps=steps, save_every=save_every, validate_every=validate_every,
+            resume=checkpoint, tags_dir=tags_dir)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -95,9 +95,8 @@ def _infer_flat_dims(size: int) -> tuple[int | None, int | None]:
 
 def build_flat_assets(flat_bytes: dict[str, bytes]) -> list[FlatAsset]:
     """One FlatAsset per flat, referencing (by sha256) the raw indexed-pixel
-    bytes a caller is expected to persist to a sidecar file - see
-    plan/data-model.md: flats are captured with their raw pixels, not just
-    their name.
+    bytes a caller is expected to persist to a sidecar file: flats are
+    captured with their raw pixels, not just their name.
     """
     assets = []
     for name, data in flat_bytes.items():

@@ -74,6 +74,8 @@ def _two_sector_core():
         (64, 64, 90, 1, 0x0007),     # Player1Start, all skills
         (192, 64, 0, 3004, 0x0007),  # Zombieman
     ]
+    # Doom front sectors lie on the right of directed linedefs.
+    linedefs = [(line[1], line[0], *line[2:]) for line in linedefs]
     return vertices, linedefs, sidedefs, sectors, things
 
 
@@ -134,6 +136,8 @@ def build_two_sector_wad_with_nodes() -> bytes:
         (5, 2, 0, 6, 0, 0),   # linedef6 front (sector1)
         (2, 1, 0, 1, 1, 0),   # linedef1 back = sector1 side
     ]
+    segs = [(v2, v1, angle, line, direction, offset)
+            for v1, v2, angle, line, direction, offset in segs]
     segs_data = b"".join(struct.pack("<hhhHhh", *s) for s in segs)
 
     # (numsegs, firstseg)
@@ -170,7 +174,7 @@ def build_hexen_wad() -> bytes:
         (1, 2, 0x0001, 0, 0, 0, 0, 0, 0, 1, 0xFFFF),
         (2, 3, 0x0001, 0, 0, 0, 0, 0, 0, 2, 0xFFFF),
         # door special (Door_Raise generalized special 12 in hexen numbering, args = speed/delay/lock)
-        (3, 0, 0x0004, 12, 16, 35, 0, 0, 0, 3, 4),
+        (3, 0, 0x0001, 12, 16, 35, 0, 0, 0, 3, 0xFFFF),
     ]
     sidedefs = [
         (0, 0, "-", "-", "STARTAN2", 0),
@@ -186,6 +190,8 @@ def build_hexen_wad() -> bytes:
         (1, 64, 64, 0, 90, 1, 0x0007, 0, 0, 0, 0, 0, 0),
         (5, 96, 96, 0, 0, 14, 0x0007, 0, 0, 0, 0, 0, 0),  # TeleportDest w/ tid
     ]
+
+    linedefs = [(line[1], line[0], *line[2:]) for line in linedefs]
 
     things_data = b"".join(
         struct.pack("<hhhhhhH", t[0], t[1], t[2], t[3], t[4], t[5], t[6]) + bytes(t[7:13])
@@ -241,22 +247,22 @@ vertex { x = 0.0; y = 128.0; }
 
 linedef
 {
-v1 = 0;
-v2 = 1;
+v1 = 1;
+v2 = 0;
 sidefront = 0;
 blocking = true;
 }
 linedef
 {
-v1 = 1;
-v2 = 2;
+v1 = 2;
+v2 = 1;
 sidefront = 1;
 blocking = true;
 }
 linedef
 {
-v1 = 2;
-v2 = 3;
+v1 = 3;
+v2 = 2;
 sidefront = 2;
 blocking = true;
 special = 1;
@@ -265,8 +271,8 @@ arg0 = 16;
 }
 linedef
 {
-v1 = 3;
-v2 = 0;
+v1 = 0;
+v2 = 3;
 sidefront = 3;
 blocking = true;
 }

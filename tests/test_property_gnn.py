@@ -25,7 +25,6 @@ from generation.vectorizer import vectorize
 from models.conditioning import TagConditioner
 from models.properties.gnn import HEADS, INPUT_COLUMNS, PropertyGNN
 from wad_parser.map_extractor import extract_all_maps
-from wad_parser.types import MapDocument
 from wad_parser.wad_reader import WadFile
 
 

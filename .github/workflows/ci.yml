@@ -1,0 +1,81 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  base:
+    name: Base / ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, python: '3.10'}
+          - {os: ubuntu-24.04, python: '3.12'}
+          - {os: ubuntu-24.04, python: '3.14'}
+          - {os: windows-2022, python: '3.12'}
+          - {os: macos-14, python: '3.12'}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.30'
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --locked --extra dev --no-default-groups
+      - run: uv run --no-sync python -m pytest -q
+      - name: Check installed base commands without torch
+        run: uv run --isolated --no-project --with . python -I tools/check_install.py
+
+  ml:
+    name: ML / Linux / Python 3.12 / CPU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.30'
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --locked --extra dev --extra ml --no-default-groups
+      - run: uv run --no-sync python -m pytest -q
+
+  engine:
+    name: Doom engine and source-port interactions
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      DOOM_GEN_ENGINE_TESTS: '1'
+      DOOM_GEN_PORT_TESTS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.11.30'
+          python-version: '3.12'
+          enable-cache: true
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y zdbsp chocolate-doom xvfb xauth
+      - run: echo '/usr/games' >> "$GITHUB_PATH"
+      - run: uv sync --locked --extra dev --extra ml --extra engine --no-default-groups
+      - run: xvfb-run -a uv run --no-sync python -m pytest -q

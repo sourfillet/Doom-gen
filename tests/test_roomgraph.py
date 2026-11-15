@@ -72,7 +72,8 @@ def _two_room_graph() -> RoomGraph:
 
 def test_assemble_makes_rooms_and_a_corridor():
     asm = assemble(_two_room_graph())
-    assert len(asm.sectors) == 3                    # 2 rooms + 1 connecting corridor
+    assert len(asm.sectors) == 5                    # 2 rooms + 2 approaches + closed door slab
+    assert sum(s.ceil_height == s.floor_height for s in asm.sectors) == 1
     two_sided = [ld for ld in asm.linedefs if ld.left_sidedef != -1]
     assert len(two_sided) >= 2                       # corridor connects to both rooms
     # every sector closes into a polygon ring (well-formed geometry)
@@ -87,7 +88,9 @@ def test_assembled_map_survives_wad_round_trip(tmp_path):
     asm = assemble(_two_room_graph())
     out = write_wad([asm], tmp_path / "asm.wad")
     redoc = extract_all_maps(WadFile(str(out)))[0]
-    assert len(redoc.sectors) == 3
+    assert len(redoc.sectors) == 5
+    from wad_parser.traversal import distances_from_start
+    assert set(distances_from_start(redoc)) == {s.id for s in redoc.sectors}
     assert any(ld.left_sidedef != -1 for ld in redoc.linedefs)  # openings survived
 
 

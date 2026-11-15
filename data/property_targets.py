@@ -9,6 +9,7 @@ safe default instead of crashing.
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
 from pathlib import Path
 
@@ -22,12 +23,13 @@ _NON_ASSET = ("-", "")
 
 
 def build_vocabs(maps_dir: Path | str, top_flats: int = 192,
-                 top_tex: int = 384) -> dict:
+                 top_tex: int = 384, *, paths=None) -> dict:
     flat_c, tex_c, spec_c = Counter(), Counter(), Counter()
-    for p in sorted(Path(maps_dir).glob("*.json")):
+    for p in sorted(paths if paths is not None else Path(maps_dir).glob("*.json")):
+        p = Path(p)
         if p.name.endswith(".textures.json"):
             continue
-        doc = MapDocument.from_dict(json.loads(p.read_text()))
+        doc = MapDocument.from_dict(json.loads(p.read_text(encoding="utf-8")))
         for s in doc.sectors:
             for flat in (s.floor_flat, s.ceil_flat):
                 if flat not in _NON_ASSET:
@@ -41,7 +43,7 @@ def build_vocabs(maps_dir: Path | str, top_flats: int = 192,
     flat = {"UNK": 0}
     for name, _ in flat_c.most_common(top_flats):
         flat[name] = len(flat)
-    tex = {"UNK": 0}
+    tex = {"UNK": 0, "-": 1}
     for name, _ in tex_c.most_common(top_tex):
         tex[name] = len(tex)
     special = {"0": 0}   # index 0 = "no special"; keys are stringified ints
@@ -83,18 +85,57 @@ def graph_sample(doc: MapDocument, vocabs: dict) -> dict:
         ceil_t[s.id] = fv.get(s.ceil_flat.upper(), 0)
         tex_t[s.id] = tv.get(wall.get(s.id, ""), 0)
         spec_t[s.id] = sv.get(str(int(s.special)), 0)
-    return {
+    result = {
         "node_features": node_in.astype(np.float32),
         "edge_index": g["edge_index"],
         "edge_features": g["edge_features"],
         "floor_flat": floor_t, "ceil_flat": ceil_t,
         "wall_tex": tex_t, "special": spec_t,
     }
+    result.update(side_sample(doc, vocabs))
+    return result
+
+
+def side_sample(doc: MapDocument, vocabs: dict | None = None) -> dict:
+    """Per-sidedef geometry, texture targets, and signed offset targets."""
+    count = len(doc.sidedefs)
+    n_sectors = len(doc.sectors)
+    features = np.zeros((count, 6), dtype=np.float32)
+    owner = np.array([side.sector for side in doc.sidedefs], dtype=np.int64)
+    other = owner.copy()
+    positions = {v.id: (v.x, v.y) for v in doc.vertices}
+    for line in doc.linedefs:
+        if line.v1 not in positions or line.v2 not in positions:
+            continue
+        a, b = positions[line.v1], positions[line.v2]
+        length = math.dist(a, b)
+        for side, opposite, direction in ((line.right_sidedef, line.left_sidedef, 1),
+                                           (line.left_sidedef, line.right_sidedef, -1)):
+            if not 0 <= side < count:
+                continue
+            neighbor = doc.sidedefs[opposite].sector if 0 <= opposite < count else owner[side]
+            other[side] = neighbor
+            if not (0 <= owner[side] < n_sectors and 0 <= neighbor < n_sectors):
+                continue
+            sector, adjacent = doc.sectors[owner[side]], doc.sectors[neighbor]
+            features[side] = [math.log2(max(length, 1)) / 16, float(opposite < 0),
+                              direction * (b[0] - a[0]) / max(length, 1),
+                              direction * (b[1] - a[1]) / max(length, 1),
+                              (adjacent.floor_height - sector.floor_height) / 1024,
+                              (adjacent.ceil_height - sector.ceil_height) / 1024]
+    result = {'side_features': features, 'side_owner': owner, 'side_neighbor': other}
+    if vocabs is not None:
+        for field in ('mid_tex', 'upper_tex', 'lower_tex'):
+            result[f'side_{field}'] = np.array([vocabs['tex'].get(getattr(side, field).upper(), 0)
+                                              for side in doc.sidedefs], dtype=np.int64)
+        result['side_offsets'] = np.array([[side.x_offset / 1024, side.y_offset / 1024]
+                                           for side in doc.sidedefs], dtype=np.float32).reshape(count, 2)
+    return result
 
 
 def save_vocabs(vocabs: dict, path: Path | str) -> None:
-    Path(path).write_text(json.dumps(vocabs))
+    Path(path).write_text(json.dumps(vocabs), encoding="utf-8")
 
 
 def load_vocabs(path: Path | str) -> dict:
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_text(encoding="utf-8"))

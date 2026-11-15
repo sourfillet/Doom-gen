@@ -15,6 +15,7 @@ import json
 import math
 import random
 
+from roomgraph.building import largest_poly, poly_centroid
 from roomgraph.corridor import signed_area
 from roomgraph.segment import segment
 
@@ -29,57 +30,35 @@ def _bbox(pts):
     return min(xs), min(ys), max(xs), max(ys)
 
 
-def _centroid(pts):
-    a = cx = cy = 0.0
-    n = len(pts)
-    for i in range(n):
-        x1, y1 = pts[i]
-        x2, y2 = pts[(i + 1) % n]
-        cr = x1 * y2 - x2 * y1
-        a += cr
-        cx += (x1 + x2) * cr
-        cy += (y1 + y2) * cr
-    if abs(a) < 1e-9:
-        return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
-    a *= 0.5
-    return (cx / (6 * a), cy / (6 * a))
+_centroid = poly_centroid
+_largest = largest_poly
 
 
 def _aspect(w: float, h: float) -> str:
     if h <= 0 or w <= 0:
         return "square"
     r = w / h
-    return "wide" if r >= 1.4 else "tall" if r <= 1 / 1.4 else "square"
+    return "wide" if r >= 1.4 else "tall" if r < 0.8 else "square"
 
 
-def _largest(polys):
-    best, best_a = None, -1.0
-    for p in polys:
-        if len(p) < 3:
-            continue
-        a = abs(signed_area(p))
-        if a > best_a:
-            best, best_a = p, a
-    return best
-
-
-def build_library(docs) -> dict:
+def build_library(docs, *, playable_only: bool = False) -> dict:
     """Segment maps and bank normalised room polygons by aspect bucket."""
     lib: dict[str, list] = {"tall": [], "square": [], "wide": []}
     for doc in docs:
-        rg = segment(doc)
+        rg = segment(doc, playable_only=playable_only)
         for r in rg.rooms:
             poly = _largest(r.polygons)
             if poly is None or not (MIN_VERTS <= len(poly) <= MAX_VERTS):
                 continue
-            area = abs(signed_area(poly))
+            area = abs(signed_area(poly)) - sum(abs(signed_area(hole)) for hole in r.holes)
             if area < MIN_AREA:
                 continue
             cx, cy = _centroid(poly)
             norm = [(x - cx, y - cy) for x, y in poly]
             x0, y0, x1, y1 = _bbox(norm)
             lib[_aspect(x1 - x0, y1 - y0)].append(
-                {"poly": norm, "area": area})
+                {"poly": norm, "area": area,
+                 "holes": [[(x - cx, y - cy) for x, y in hole] for hole in r.holes]})
     return lib
 
 
@@ -91,7 +70,8 @@ def save_library(lib: dict, path) -> None:
 def load_library(path) -> dict:
     with open(path) as f:
         raw = json.load(f)
-    return {k: [{"poly": [tuple(p) for p in s["poly"]], "area": s["area"]}
+    return {k: [{"poly": [tuple(p) for p in s["poly"]], "area": s["area"],
+                 "holes": [[tuple(p) for p in hole] for hole in s.get('holes', [])]}
                 for s in v] for k, v in raw.items()}
 
 
@@ -104,14 +84,16 @@ def _bucket(lib: dict, aspect: str):
     return None
 
 
-def retrieve(lib: dict, aspect: str, target_area: float, rng: random.Random):
+def retrieve(lib: dict, aspect: str, target_area: float, rng: random.Random, *, with_holes=False):
     """A real polygon of the given aspect, uniformly scaled to target_area."""
     bucket = _bucket(lib, aspect)
     if not bucket:
         return None
     shape = rng.choice(bucket)
     s = math.sqrt(max(target_area, 1.0) / max(shape["area"], 1.0))
-    return [(x * s, y * s) for x, y in shape["poly"]]
+    poly = [(x * s, y * s) for x, y in shape["poly"]]
+    holes = [[(x * s, y * s) for x, y in hole] for hole in shape.get('holes', [])]
+    return (poly, holes) if with_holes else poly
 
 
 def apply_shapes(graph, lib: dict, seed: int = 0):
@@ -121,11 +103,13 @@ def apply_shapes(graph, lib: dict, seed: int = 0):
     for r in graph.rooms:
         w, h = r.size
         aspect = _aspect(w, h) if (w > 0 and h > 0) else "square"
-        poly = retrieve(lib, aspect, max(r.area, MIN_AREA), rng)
-        if poly is None:
+        shape = retrieve(lib, aspect, max(r.area, MIN_AREA), rng, with_holes=True)
+        if shape is None:
             continue
+        poly, holes = shape
         x0, y0, x1, y1 = _bbox(poly)
         r.polygons = [poly]
+        r.holes = holes
         r.bbox = (x0, y0, x1, y1)
         r.centroid = _centroid(poly)
     return graph

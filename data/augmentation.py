@@ -1,8 +1,9 @@
 """Geometric/photometric augmentation on MAP DOCUMENTS, not tensors -
 mirror/rotate transform the raw layer (with thing-angle correction,
-linedef v1/v2 + sidedef swapping, and slope-plane rotation), then the
-derived layer is recomputed from scratch via compute_derived, never
-transformed in place (plan/generation.md + the derived-layer purity rule).
+linedef v1/v2 reversal, and slope-plane rotation), then the
+derived layer is recomputed via compute_derived. Compiled BSP coordinate
+regions are geometric input unavailable from raw authoring lines alone;
+their affine transform is validated and preserved during recomputation.
 
 Mirroring flips handedness: the sector that was on the right of v1->v2
 lands on the LEFT of the mirrored line. Swapping v1/v2 (and ONLY that -
@@ -51,9 +52,15 @@ def _hexen_style(doc: MapDocument) -> bool:
 def _recompute(doc: MapDocument) -> None:
     bounds, derived = compute_derived(
         doc.vertices, doc.sectors, doc.linedefs, doc.sidedefs, doc.things,
-        hexen_style=_hexen_style(doc))
+        hexen_style=_hexen_style(doc), region_geometry=doc.derived.sector_regions or None,
+        region_info=doc.derived.bsp_geometry)
     doc.bounds = bounds
     doc.derived = derived
+
+
+def _mark_augmented(doc: MapDocument, label: str) -> None:
+    doc.extra = dict(doc.extra or {})
+    doc.extra["augmented"] = doc.extra.get("augmented", []) + [label]
 
 
 def transform_document(doc: MapDocument, op: str) -> MapDocument:
@@ -68,6 +75,12 @@ def transform_document(doc: MapDocument, op: str) -> MapDocument:
     for t in out.things:
         t.x, t.y = point_fn(t.x, t.y)
         t.angle = angle_fn(t.angle)
+    if out.derived.sector_regions:
+        out.derived.sector_regions = [[[point_fn(x, y) for x, y in ring] for ring in rings]
+                                      for rings in out.derived.sector_regions]
+    extra = out.extra or {}
+    for key, point in extra.get('sector_seed_points', {}).items():
+        extra['sector_seed_points'][key] = list(point_fn(*point))
     if flips:
         for ld in out.linedefs:
             ld.v1, ld.v2 = ld.v2, ld.v1
@@ -76,20 +89,20 @@ def transform_document(doc: MapDocument, op: str) -> MapDocument:
             if slope is not None:
                 slope.a, slope.b = slope_fn(slope.a, slope.b)
 
-    out.extra = dict(out.extra)
-    out.extra["augmented"] = out.extra.get("augmented", []) + [op]
+    _mark_augmented(out, op)
     _recompute(out)
     return out
 
 
 def jitter_lights(doc: MapDocument, amount: int = 16, seed: int | None = None) -> MapDocument:
     """Per-sector light-level jitter, +/- amount, clamped to 0..255."""
+    if amount < 0:
+        raise ValueError("amount must be non-negative")
     rng = np.random.default_rng(seed)
     out = copy.deepcopy(doc)
     for s in out.sectors:
         s.light_level = int(np.clip(s.light_level + rng.integers(-amount, amount + 1), 0, 255))
-    out.extra = dict(out.extra)
-    out.extra["augmented"] = out.extra.get("augmented", []) + ["jitter_lights"]
+    _mark_augmented(out, "jitter_lights")
     return out
 
 
@@ -97,13 +110,20 @@ def jitter_heights(doc: MapDocument, amount: int = 16, seed: int | None = None) 
     """Per-sector vertical shift in 8-unit quanta, floor and ceiling moved
     TOGETHER so room heights, door states (ceil==floor), and relative step
     feel are preserved; only inter-sector steps jitter."""
+    if amount < 0:
+        raise ValueError("amount must be non-negative")
     rng = np.random.default_rng(seed)
     out = copy.deepcopy(doc)
     for s in out.sectors:
         delta = int(rng.integers(-amount // 8, amount // 8 + 1)) * 8
+        lo = -32768 - min(s.floor_height, s.ceil_height)
+        hi = 32767 - max(s.floor_height, s.ceil_height)
+        if lo <= hi:
+            delta = max(lo, min(hi, delta))
+        else:
+            delta = 0
         s.floor_height += delta
         s.ceil_height += delta
-    out.extra = dict(out.extra)
-    out.extra["augmented"] = out.extra.get("augmented", []) + ["jitter_heights"]
+    _mark_augmented(out, "jitter_heights")
     _recompute(out)  # reachability heuristics may care about steps
     return out

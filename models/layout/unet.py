@@ -1,7 +1,6 @@
-"""Compact conditional U-Net for layout diffusion (plan/generation.md,
-Stage 1). Time + tag conditioning enter every residual block via FiLM
+"""Compact conditional U-Net for layout diffusion (Stage 1). Time + tag conditioning enter every residual block via FiLM
 (per-channel scale/shift), self-attention at the bottleneck. Sized for a
-128px 9-channel raster on an 8 GB GPU (~20M params at base=64).
+128px multi-channel raster (20 channels in RASTER_VERSION=5) on an 8 GB GPU.
 """
 from __future__ import annotations
 
@@ -15,11 +14,14 @@ import torch.nn.functional as F
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
+        if dim < 2 or dim % 2 != 0:
+            raise ValueError(f"SinusoidalTimeEmbedding dim must be a positive even integer, got {dim}")
         self.dim = dim
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.dim // 2
-        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / (half - 1))
+        denom = max(half - 1, 1)
+        freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / denom)
         args = t.float()[:, None] * freqs[None]
         return torch.cat([args.sin(), args.cos()], dim=-1)
 
@@ -59,6 +61,11 @@ class UNet(nn.Module):
     def __init__(self, in_channels: int = 9, base: int = 64,
                  mults: tuple[int, ...] = (1, 2, 4), emb_dim: int = 256):
         super().__init__()
+        if not mults:
+            raise ValueError("UNet mults must be non-empty")
+        chans = [base * m for m in mults]
+        if any(ch <= 0 or ch % 8 != 0 for ch in chans):
+            raise ValueError(f"UNet channel counts {chans} must be positive multiples of 8")
         self.time_embed = nn.Sequential(
             SinusoidalTimeEmbedding(emb_dim),
             nn.Linear(emb_dim, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim),
@@ -66,7 +73,6 @@ class UNet(nn.Module):
         self.cond_proj = nn.Sequential(nn.Linear(emb_dim, emb_dim), nn.SiLU(),
                                        nn.Linear(emb_dim, emb_dim))
 
-        chans = [base * m for m in mults]
         self.stem = nn.Conv2d(in_channels, chans[0], 3, padding=1)
 
         self.down_blocks = nn.ModuleList()
@@ -99,6 +105,11 @@ class UNet(nn.Module):
         self.out_conv = nn.Conv2d(chans[0], in_channels, 3, padding=1)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        stride_factor = 1 << (len(self.down_blocks) - 1)
+        if x.shape[2] % stride_factor != 0 or x.shape[3] % stride_factor != 0:
+            raise ValueError(
+                f"input spatial size {(x.shape[2], x.shape[3])} must be divisible by {stride_factor}"
+            )
         emb = self.time_embed(t) + self.cond_proj(cond)
         h = self.stem(x)
         skips = []

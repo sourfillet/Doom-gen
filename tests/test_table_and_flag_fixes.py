@@ -221,7 +221,8 @@ def test_boom_line_teleport_edge(tmp_path):
     ]))
     doc = extract_all_maps(WadFile(str(p)))[0]
     teleport_edges = [e for e in doc.derived.sector_graph["edges"] if e["kind"] == "teleport"]
-    assert {"a": 0, "b": 1, "linedef": 0, "kind": "teleport"} in teleport_edges
+    assert any(edge["a"] == 0 and edge["b"] == 1 and edge["linedef"] == 0
+               and edge["directed"] for edge in teleport_edges)
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +265,19 @@ def test_corrupt_directory_rejected(tmp_path):
         pass
 
 
+def test_negative_directory_counts_offsets_and_lump_sizes_are_rejected(tmp_path):
+    import pytest
+    original = build_two_sector_wad()
+    directory = struct.unpack_from('<i', original, 8)[0]
+    for offset in (4, 8, directory + 16 + 4):
+        raw = bytearray(original)
+        struct.pack_into('<i', raw, offset, -1)
+        path = tmp_path / f'negative-{offset}.wad'
+        path.write_bytes(raw)
+        with pytest.raises(ValueError):
+            WadFile(str(path))
+
+
 def test_multiple_flat_spans_all_collected(tmp_path):
     lumps = [
         ("F_START", b""), ("FLATA", b"\x01" * 64), ("F_END", b""),
@@ -274,3 +288,86 @@ def test_multiple_flat_spans_all_collected(tmp_path):
     p.write_bytes(_assemble_wad(lumps))
     flats = WadFile(str(p)).find_flats()
     assert set(flats) == {"FLATA", "FLATB"}
+
+
+def test_duplicate_lump_lookup_prefers_last_occurrence(tmp_path):
+    lumps = [
+        ("TEXTURE1", b"first_texture_table"),
+        ("COLORMAP", b"colormap_v1"),
+        ("TEXTURE1", b"replacement_texture_table"),
+        ("COLORMAP", b"colormap_v2"),
+    ]
+    p = tmp_path / "duplicates.wad"
+    p.write_bytes(_assemble_wad(lumps))
+    wad = WadFile(str(p))
+    # get_lump scans backwards matching Doom W_GetNumForName and get_all_lumps()[-1]
+    assert wad.get_lump("TEXTURE1") == b"replacement_texture_table"
+    assert wad.get_lump("COLORMAP") == b"colormap_v2"
+    assert wad.get_all_lumps("TEXTURE1") == [b"first_texture_table", b"replacement_texture_table"]
+    assert wad.get_all_lumps("TEXTURE1")[-1] == wad.get_lump("TEXTURE1")
+    assert wad.get_lump("NONEXISTENT") is None
+
+
+def test_mixed_flat_marker_pairs_and_ordering(tmp_path):
+    # 1. Mismatched start/end pairs (FF_START ... F_END and F_START ... FF_END)
+    mismatched = [
+        ("FF_START", b""), ("FLAT_M1", b"\x01" * 64), ("F_END", b""),
+        ("OTHER", b"x"),
+        ("F_START", b""), ("FLAT_M2", b"\x02" * 64), ("FF_END", b""),
+    ]
+    p = tmp_path / "mismatched.wad"
+    p.write_bytes(_assemble_wad(mismatched))
+    flats = WadFile(str(p)).find_flats()
+    assert set(flats) == {"FLAT_M1", "FLAT_M2"}
+    assert flats["FLAT_M1"] == b"\x01" * 64
+    assert flats["FLAT_M2"] == b"\x02" * 64
+
+    # 2. File-order precedence: later definitions override earlier ones
+    precedence = [
+        ("FF_START", b""), ("SHARED", b"early_version"), ("FF_END", b""),
+        ("F_START", b""), ("SHARED", b"late_version"), ("F_END", b""),
+    ]
+    p_prec = tmp_path / "precedence.wad"
+    p_prec.write_bytes(_assemble_wad(precedence))
+    assert WadFile(str(p_prec)).find_flats()["SHARED"] == b"late_version"
+
+    # 3. DOOM.WAD-style nested sub-markers inside F_START ... F_END
+    nested = [
+        ("F_START", b""),
+        ("F1_START", b""), ("FLOOR0_1", b"\x01" * 64), ("F1_END", b""),
+        ("F2_START", b""), ("FLOOR0_2", b"\x02" * 64), ("F2_END", b""),
+        ("F_END", b""),
+    ]
+    p_nested = tmp_path / "nested.wad"
+    p_nested.write_bytes(_assemble_wad(nested))
+    flats_nested = WadFile(str(p_nested)).find_flats()
+    assert set(flats_nested) == {"FLOOR0_1", "FLOOR0_2"}
+
+    # 4. Standalone sub-markers without outer F_START
+    standalone = [
+        ("F1_START", b""), ("FLOR_SUB", b"\x03" * 64), ("F1_END", b""),
+    ]
+    p_sub = tmp_path / "sub.wad"
+    p_sub.write_bytes(_assemble_wad(standalone))
+    assert set(WadFile(str(p_sub)).find_flats()) == {"FLOR_SUB"}
+
+    # 5. Double end markers (FF_END followed immediately by F_END)
+    double_end = [
+        ("FF_START", b""), ("MYFLAT", b"\x04" * 64), ("FF_END", b""), ("F_END", b""),
+        ("MAP01", b""), ("THINGS", b"1234"),
+    ]
+    p_double = tmp_path / "double_end.wad"
+    p_double.write_bytes(_assemble_wad(double_end))
+    wad_double = WadFile(str(p_double))
+    assert set(wad_double.find_flats()) == {"MYFLAT"}
+    assert wad_double.get_lump("THINGS") == b"1234"
+
+    # 6. Unclosed marker does not consume subsequent map lumps
+    unclosed = [
+        ("F_START", b""),
+        ("MAP01", b""), ("THINGS", b"map_things"), ("LINEDEFS", b"map_lines"),
+    ]
+    p_unclosed = tmp_path / "unclosed.wad"
+    p_unclosed.write_bytes(_assemble_wad(unclosed))
+    assert WadFile(str(p_unclosed)).find_flats() == {}
+    assert WadFile(str(p_unclosed)).get_lump("THINGS") == b"map_things"

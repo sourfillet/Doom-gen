@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wad_builder import build_hexen_wad, build_udmf_wad
 
 from wad_parser.map_extractor import extract_all_maps
-from wad_parser.udmf_parser import parse_textmap, build_linedefs, build_sectors, build_things, build_vertices
+from wad_parser.udmf_parser import parse_textmap, build_sectors, build_vertices
 from wad_parser.wad_reader import WadFile
 
 

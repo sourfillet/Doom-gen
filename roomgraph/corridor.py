@@ -95,8 +95,8 @@ def _opening(poly, edge, dist_from_start, half=CORR_HALF):
         d1 = d0 + want
     if d1 - d0 < floor:
         return None
-    p0 = (px + ux * d0, py + uy * d0)
-    p1 = (px + ux * d1, py + uy * d1)
+    p0 = (px, py) if d0 <= 0.0 else (px + ux * d0, py + uy * d0)
+    p1 = (qx, qy) if d1 >= L else (px + ux * d1, py + uy * d1)
     return Opening(edge=edge, d0=d0, d1=d1, p0=p0, p1=p1)
 
 
@@ -179,13 +179,13 @@ def _mid(o):
     return ((o.p0[0] + o.p1[0]) / 2, (o.p0[1] + o.p1[1]) / 2)
 
 
-def plan_candidates(origin_a, poly_a, origin_b, poly_b, k=4):
+def plan_candidates(origin_a, poly_a, origin_b, poly_b, k=4, half_width=CORR_HALF):
     """All viable corridor plans over the top-k facing walls of each room,
     shortest first. The assembler tries them in order and takes the first that
     carves cleanly (doesn't clip a concave room or an existing corridor)."""
-    sides_a = [(_opening(poly_a, e, _dist_along(poly_a, e, p)))
+    sides_a = [(_opening(poly_a, e, _dist_along(poly_a, e, p), half=half_width))
                for e, p in _facing_edges(poly_a, origin_b, k)]
-    sides_b = [(_opening(poly_b, e, _dist_along(poly_b, e, p)))
+    sides_b = [(_opening(poly_b, e, _dist_along(poly_b, e, p), half=half_width))
                for e, p in _facing_edges(poly_b, origin_a, k)]
     plans = []
     for oa in sides_a:

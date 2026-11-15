@@ -3,8 +3,8 @@ a map/WAD, derived from parsed data.
 
 These are deliberately different from heuristic *suggestions* (style/theme
 guesses, which stay human-confirmed): every rule here is a verifiable fact
-with a documented basis, not a judgment call. They form a derived layer in
-the same sense as plan/data-model.md's derived data:
+with a documented basis, not a judgment call. They form a derived layer,
+like the extracted map's derived data:
 
   - stored in separate .auto.json files, regenerated wholesale, never
     hand-edited;
@@ -69,17 +69,24 @@ def _feature_tier(doc: MapDocument) -> str | None:
     if doc.meta.format != "doom":
         return None
     tier = "vanilla"
+    has_unrecognized = False
     for ld in doc.linedefs:
         if ld.special in _MBF21_SPECIALS:
             return "mbf21"
         if ld.special in _MBF_SPECIALS:
             tier = "mbf"
-        elif tier == "vanilla" and (
-            141 < ld.special < 1024 or 0x2F80 <= ld.special <= 0x7FFF
-        ):
-            tier = "boom"
-    if tier == "vanilla" and any(s.special >= 128 for s in doc.sectors):
-        tier = "boom"  # generalized sector-special bits in use
+        elif 141 < ld.special <= 269 or 0x2F80 <= ld.special <= 0x7FFF:
+            if tier == "vanilla":
+                tier = "boom"
+        elif ld.special < 0 or ld.special > 141:
+            has_unrecognized = True
+    if any(s.special < 0 or s.special >= 32 for s in doc.sectors):
+        if any(s.special < 0 or s.special > 0x0FFF for s in doc.sectors):
+            has_unrecognized = True
+        elif tier == "vanilla":
+            tier = "boom"  # generalized sector-special bits (0x0020..0x0FFF) in use
+    if has_unrecognized and tier == "vanilla":
+        return None
     return tier
 
 
@@ -95,13 +102,15 @@ def derive_map_facts(doc: MapDocument) -> dict[str, float]:
         tags["deathmatch"] = 1.0
 
     is_doom_format = doc.meta.format == "doom"
-    if any(s.special == 9 or (is_doom_format and s.special & 0x0080) for s in doc.sectors):
+    udmf_ns = str((doc.extra or {}).get("udmf_namespace") or "").lower()
+    is_doom_actors = is_doom_format or (doc.meta.format == "udmf" and udmf_ns not in {"hexen", "heretic", "strife"})
+    if any(s.special == 9 or (is_doom_format and s.special >= 32 and (s.special & 0x0080)) for s in doc.sectors):
         tags["secrets"] = 1.0
     if any(e.get("kind") == "teleport" for e in doc.derived.sector_graph.get("edges", [])):
         tags["teleporters"] = 1.0
     if any(t.category == "key" for t in doc.things):
         tags["keys"] = 1.0
-    if any(t.type in _BOSS_DOOMED_NUMS for t in doc.things):
+    if is_doom_actors and any(t.type in _BOSS_DOOMED_NUMS for t in doc.things):
         tags["boss"] = 1.0
     if any(s.floor_slope or s.ceil_slope for s in doc.sectors) or \
             any(v.z is not None for v in doc.vertices):

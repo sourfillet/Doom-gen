@@ -1,5 +1,5 @@
 """Assembles a MapDocument from parsed lumps (binary or UDMF) and computes
-the derived layer described in plan/data-model.md: sector polygons,
+the derived layer: sector polygons,
 adjacency graph, trigger map, reachability from player starts, a texture
 alignment heuristic, and symmetry detection.
 
@@ -9,9 +9,8 @@ without re-reading the source WAD.
 """
 from __future__ import annotations
 
-import math
 import struct
-from collections import defaultdict, deque
+from collections import defaultdict
 
 from wad_parser import lump_parser, udmf_parser
 from wad_parser.types import (
@@ -27,51 +26,6 @@ def _bounds(vertices) -> BoundingBox:
     xs = [v.x for v in vertices]
     ys = [v.y for v in vertices]
     return BoundingBox(min(xs), max(xs), min(ys), max(ys))
-
-
-def _sector_polygons(sectors, linedefs, sidedefs) -> list[list[int]]:
-    """One boundary ring per sector (the largest reconstructed loop, in the
-    rare case a sector has disjoint islands - a simplification documented
-    here rather than silently made).
-    """
-    sector_edges: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    for ld in linedefs:
-        if ld.right_sidedef != -1 and ld.right_sidedef < len(sidedefs):
-            sector_edges[sidedefs[ld.right_sidedef].sector].append((ld.v1, ld.v2))
-        if ld.left_sidedef != -1 and ld.left_sidedef < len(sidedefs):
-            sector_edges[sidedefs[ld.left_sidedef].sector].append((ld.v2, ld.v1))
-
-    polygons: list[list[int]] = [[] for _ in sectors]
-    for sector_id, edges in sector_edges.items():
-        if sector_id >= len(polygons):
-            continue
-        edge_map: dict[int, list[int]] = defaultdict(list)
-        for a, b in edges:
-            edge_map[a].append(b)
-        visited: set[tuple[int, int]] = set()
-        loops: list[list[int]] = []
-        for a, b in edges:
-            if (a, b) in visited:
-                continue
-            loop = [a]
-            visited.add((a, b))
-            cur, nxt = a, b
-            steps = 0
-            while nxt != a and steps < len(edges) + 1:
-                loop.append(nxt)
-                found = None
-                for c in edge_map.get(nxt, []):
-                    if (nxt, c) not in visited:
-                        found = c
-                        break
-                if found is None:
-                    break
-                visited.add((nxt, found))
-                cur, nxt = nxt, found
-                steps += 1
-            loops.append(loop)
-        polygons[sector_id] = max(loops, key=len) if loops else []
-    return polygons
 
 
 def _sector_adjacency(sectors, linedefs, sidedefs) -> dict:
@@ -106,7 +60,7 @@ _HEXEN_TELEPORT_SPECIALS = {70, 71}
 
 
 def _front_sector(ld, sidedefs) -> int | None:
-    if ld.right_sidedef == -1 or ld.right_sidedef >= len(sidedefs):
+    if not 0 <= ld.right_sidedef < len(sidedefs):
         return None
     return sidedefs[ld.right_sidedef].sector
 
@@ -139,33 +93,39 @@ def _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices,
                 elif t.category != "teleport-dest":
                     continue
                 dest = sector_of_thing(t)
-                if dest is not None and dest != src_sector:
-                    edges.append({"a": src_sector, "b": dest, "linedef": ld.id, "kind": "teleport"})
+                if dest is not None:
+                    edges.append({"a": src_sector, "b": dest, "linedef": ld.id, "kind": "teleport",
+                                  "destination_point": [t.x, t.y]})
         return edges
 
     # --- Doom/Boom namespace ---
     if any(ld.special in _THING_TELEPORT_SPECIALS for ld in linedefs):
-        dest_by_sector: list[tuple[int, int]] = []  # (sector_id, sector_tag)
+        dest_by_sector = []  # (sector_id, sector_tag, thing)
         tag_by_sector = {s.id: s.tag for s in sectors}
         for t in things:
             if t.category != "teleport-dest":
                 continue
+            from wad_parser.types import active_single_player
+            if not active_single_player(t):
+                continue
             sec = sector_of_thing(t)
             if sec is not None:
-                dest_by_sector.append((sec, tag_by_sector.get(sec, 0)))
+                dest_by_sector.append((sec, tag_by_sector.get(sec, 0), t))
         for ld in linedefs:
             if ld.special not in _THING_TELEPORT_SPECIALS:
                 continue
             src_sector = _front_sector(ld, sidedefs)
             if src_sector is None:
                 continue
-            # Tagged teleporters target only destinations in a same-tagged
-            # sector; untagged (invalid in-game) connect to every destination.
-            candidates = [s for s, tag in dest_by_sector if ld.tag and tag == ld.tag] if ld.tag else \
-                [s for s, _ in dest_by_sector]
-            for dest_sector in candidates:
-                if dest_sector != src_sector:
-                    edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id, "kind": "teleport"})
+            # Vanilla searches sectors in index order, then the first
+            # teleport destination in that sector, including matching tag 0.
+            candidates = sorted((record for record in dest_by_sector if record[1] == ld.tag),
+                                key=lambda record: (record[0], record[2].id))
+            if ld.special in {39, 97, 125, 126}:
+                candidates = candidates[:1]
+            for dest_sector, _, destination in candidates:
+                edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id,
+                              "kind": "teleport", "destination_point": [destination.x, destination.y]})
 
     line_teleports = [ld for ld in linedefs if ld.special in _LINE_TELEPORT_SPECIALS and ld.tag]
     if line_teleports:
@@ -182,7 +142,7 @@ def _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices,
                     continue
                 dest_sector = _front_sector(other, sidedefs)
                 if dest_sector is not None and dest_sector != src_sector:
-                    edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id, "kind": "teleport"})
+                    edges.append({"a": src_sector, "b": dest_sector, "linedef": ld.id, "kind": "teleport", "destination_line": other.id})
     return edges
 
 
@@ -218,58 +178,23 @@ def _trigger_map(sectors, linedefs, hexen_style: bool = False) -> dict[str, list
     return dict(triggers)
 
 
-def _point_in_polygon(x, y, poly_pts) -> bool:
-    inside = False
-    n = len(poly_pts)
-    for i in range(n):
-        x1, y1 = poly_pts[i]
-        x2, y2 = poly_pts[(i + 1) % n]
-        if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1):
-            inside = not inside
-    return inside
+def _sector_containing(x, y, sectors, polygons, vertices, locator=None) -> int | None:
+    """Deterministic ownership of filled regions and their covered boundaries.
 
-
-def _sector_containing(x, y, sectors, polygons, vertices) -> int | None:
+    A center on an open sector boundary still needs an owner. This geometric
+    lookup does not certify actor clearance; points in void interiors stay None.
+    """
+    if locator is not None:
+        return locator.owner(x, y)
+    from wad_parser.geometry import point_in_rings, rings_area_perimeter, resolve_rings
     vpos = {v.id: (v.x, v.y) for v in vertices}
-    best_fallback, best_dist = None, math.inf
-    for s in sectors:
-        ring = polygons[s.id] if s.id < len(polygons) else []
-        pts = [vpos[v] for v in ring if v in vpos]
-        if len(pts) >= 3 and _point_in_polygon(x, y, pts):
-            return s.id
-        if pts:
-            cx = sum(p[0] for p in pts) / len(pts)
-            cy = sum(p[1] for p in pts) / len(pts)
-            d = (cx - x) ** 2 + (cy - y) ** 2
-            if d < best_dist:
-                best_dist, best_fallback = d, s.id
-    return best_fallback
-
-
-def _reachable_from_start(sectors, things, polygons, vertices, adjacency) -> list[int]:
-    starts = [t for t in things if t.category == "player-start"]
-    if not starts:
-        return []
-    start_sectors = set()
-    for t in starts:
-        sec = _sector_containing(t.x, t.y, sectors, polygons, vertices)
-        if sec is not None:
-            start_sectors.add(sec)
-
-    neighbors: dict[int, set[int]] = defaultdict(set)
-    for e in adjacency["edges"]:
-        neighbors[e["a"]].add(e["b"])
-        neighbors[e["b"]].add(e["a"])
-
-    seen = set(start_sectors)
-    q = deque(start_sectors)
-    while q:
-        cur = q.popleft()
-        for nb in neighbors.get(cur, ()):
-            if nb not in seen:
-                seen.add(nb)
-                q.append(nb)
-    return sorted(seen)
+    candidates = []
+    for sector in sectors:
+        parts = polygons[sector.id] if 0 <= sector.id < len(polygons) else []
+        points = resolve_rings(parts, vpos)
+        if point_in_rings(x, y, points, boundary=True):
+            candidates.append((rings_area_perimeter(points)[0], sector.id))
+    return min(candidates)[1] if candidates else None
 
 
 def _texture_alignment_score(sectors, linedefs, sidedefs, polygons) -> float | None:
@@ -286,7 +211,7 @@ def _texture_alignment_score(sectors, linedefs, sidedefs, polygons) -> float | N
             sidedef_for_edge[(ld.v2, ld.v1)] = ld.left_sidedef
 
     matches, total = 0, 0
-    for ring in polygons:
+    for ring in (ring for parts in polygons for ring in parts):
         if len(ring) < 2:
             continue
         prev_off = None
@@ -306,7 +231,7 @@ def _texture_alignment_score(sectors, linedefs, sidedefs, polygons) -> float | N
 
 def _normalized_space(vertices, bounds: BoundingBox) -> dict | None:
     """Re-centered, unit-scaled vertex coordinates, kept alongside (not
-    instead of) the raw vertex list - see plan/data-model.md.
+    instead of) the raw vertex list.
     """
     if not vertices:
         return None
@@ -324,8 +249,8 @@ def _normalized_space(vertices, bounds: BoundingBox) -> dict | None:
 
 
 def _bsp_sanity_check(group: MapLumpGroup, linedefs, sidedefs, sectors, polygons) -> dict | None:
-    """Opportunistic cross-check against the map's own compiled BSP, per
-    plan/data-model.md: SEGS/SSECTORS/NODES/REJECT aren't stored as training
+    """Opportunistic cross-check against the map's own compiled BSP.
+    SEGS/SSECTORS/NODES/REJECT aren't stored as training
     data (they're artifacts of a node-builder's internal choices, not
     authored map content), but reading them lets us flag a sector-polygon
     reconstruction bug rather than silently shipping bad derived data.
@@ -417,26 +342,71 @@ def _parse_udmf_group(group: MapLumpGroup):
     return vertices, sectors, linedefs, sidedefs, things, doc
 
 
+def _recoverable_boundary_issue(issue):
+    return ((issue.startswith('sector ') and 'open or degenerate' in issue)
+            or (issue.startswith('linedef ') and issue.endswith(': zero-length boundary')))
+
+
 def compute_derived(vertices, sectors, linedefs, sidedefs, things,
                     hexen_style: bool = False,
-                    group: MapLumpGroup | None = None) -> tuple[BoundingBox, DerivedData]:
+                    group: MapLumpGroup | None = None, *, region_geometry=None,
+                    region_info=None) -> tuple[BoundingBox, DerivedData]:
     """The full derived-layer pass, callable on any raw element set - used
     by extract_map and by data/augmentation.py to recompute derived data
     after a geometric transform (derived data is never transformed in
     place; it is always a pure function of the raw layer). The BSP
     sanity-check needs the original lump group and is skipped without one.
     """
-    polygons = _sector_polygons(sectors, linedefs, sidedefs)
+    from wad_parser.geometry import DERIVED_VERSION, reconstruct_rings, signed_area
+    rings, geometry_issues = reconstruct_rings(vertices, sectors, linedefs, sidedefs)
+    raw_geometry_issues = list(geometry_issues)
+    sector_regions, bsp_geometry = [], None
+    if region_geometry is not None and all(_recoverable_boundary_issue(issue) for issue in geometry_issues):
+        from wad_parser.bsp_geometry import component_polygons, _union
+        if len(region_geometry) != len(sectors):
+            raise ValueError('compiled region count differs from sectors')
+        polygons = [polygon for parts in region_geometry for _, polygon in component_polygons(parts)]
+        area = sum(polygon.area for polygon in polygons)
+        if area - _union(polygons).area > max(1 / 65536, area * 1e-9):
+            raise ValueError('preserved compiled regions overlap')
+        sector_regions = region_geometry
+        bsp_geometry = dict(region_info or {'method': 'preserved-compiled-regions-v1'})
+        geometry_issues = []
+    if group is not None and all(_recoverable_boundary_issue(issue) for issue in geometry_issues):
+        from wad_parser.bsp_geometry import reconstruct_bsp
+        try:
+            recovered = reconstruct_bsp(group, vertices, linedefs, sidedefs, len(sectors))
+            if recovered is not None:
+                sector_regions, bsp_geometry = recovered
+                geometry_issues = []
+        except ValueError as exc:
+            bsp_geometry = {'failure': str(exc)}
+    effective = sector_regions or rings
+    positions = {v.id: (v.x, v.y) for v in vertices}
+    polygons = [max(parts, key=lambda ring: abs(signed_area([positions[v] for v in ring])), default=[])
+                for parts in rings]
     adjacency = _sector_adjacency(sectors, linedefs, sidedefs)
-    adjacency["edges"] += _teleport_edges(sectors, linedefs, sidedefs, things, polygons, vertices,
+    adjacency["edges"] += _teleport_edges(sectors, linedefs, sidedefs, things, effective, vertices,
                                           hexen_style=hexen_style)
     triggers = _trigger_map(sectors, linedefs, hexen_style=hexen_style)
-    reachable = _reachable_from_start(sectors, things, polygons, vertices, adjacency)
-    alignment = _texture_alignment_score(sectors, linedefs, sidedefs, polygons)
+    from wad_parser.traversal import distances_from_raw, TRAVERSAL_VERSION
+    teleport_edges = [edge for edge in adjacency['edges'] if edge.get('kind') == 'teleport']
+    for edge in teleport_edges:
+        edge['directed'] = True
+    reachable = sorted(distances_from_raw(vertices, sectors, linedefs, sidedefs, things,
+                                          effective, teleport_edges, hexen_style=hexen_style))
+    alignment = _texture_alignment_score(sectors, linedefs, sidedefs, rings)
     bounds = _bounds(vertices)
     derived = DerivedData(
         sector_graph=adjacency,
         sector_polygons=polygons,
+        sector_rings=rings,
+        sector_regions=sector_regions,
+        raw_geometry_issues=raw_geometry_issues,
+        bsp_geometry=bsp_geometry,
+        geometry_issues=geometry_issues,
+        derived_version=DERIVED_VERSION,
+        traversal_version=TRAVERSAL_VERSION,
         trigger_map=triggers,
         reachable_from_start=reachable,
         texture_alignment_score=alignment,
@@ -487,7 +457,7 @@ def extract_map(wad: WadFile, group: MapLumpGroup, mapinfo: dict | None = None) 
     )
 
 
-def extract_all_maps(wad: WadFile) -> list[MapDocument]:
+def extract_all_maps(wad: WadFile, map_name: str | None = None) -> list[MapDocument]:
     from wad_parser.mapinfo_parser import parse_mapinfo
 
     # UMAPINFO (the Boom/MBF21-lineage standard) uses the same
@@ -499,4 +469,5 @@ def extract_all_maps(wad: WadFile) -> list[MapDocument]:
         if data:
             mapinfo.update(parse_mapinfo(data))
 
-    return [extract_map(wad, group, mapinfo) for group in wad.find_map_groups()]
+    return [extract_map(wad, group, mapinfo) for group in wad.find_map_groups()
+            if map_name is None or group.name.upper() == map_name.upper()]

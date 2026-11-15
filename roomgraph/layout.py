@@ -1,7 +1,6 @@
-"""Force-directed room layout (plan/graph-native.md, Phase 10 - real
-geometry). Replaces the grid placement: rooms are bodies, graph connections
-are springs pulling neighbours together, and overlap is resolved by
-repulsion. The result is ORGANIC, non-grid positions - the first half of
+"""Force-directed room layout. Replaces the grid placement: rooms are
+bodies, graph connections are springs pulling neighbours together, and
+overlap is resolved by repulsion. The result is ORGANIC, non-grid positions - the first half of
 killing the "squares on a grid" look (the other half is emitting each room's
 real polygon shape instead of a rectangle).
 
@@ -14,13 +13,23 @@ import math
 import random
 from collections import deque
 
-from roomgraph.types import Connection, RoomGraph
+from shapely.geometry import Polygon
+
+from roomgraph.types import RoomGraph
 
 GAP = 288.0           # desired clear space between room circles
 EDGE_SLACK = 96.0     # desired extra distance between connected rooms (corridor)
 
 
 def _radius(room) -> float:
+    shells = [Polygon(ring) for ring in room.polygons if len(ring) >= 3]
+    if shells:
+        # Assembly places the largest shell's area centroid at the solved
+        # position, which need not be the bounding-box midpoint (or the stored
+        # room centroid). Enclose the vertices around that same origin.
+        shell = max(shells, key=lambda poly: poly.area)
+        center = shell.centroid.coords[0]
+        return max(64.0, max(math.dist(center, point) for point in shell.exterior.coords))
     w = room.bbox[2] - room.bbox[0]
     h = room.bbox[3] - room.bbox[1]
     return max(0.5 * math.hypot(w, h), 64.0)
@@ -37,37 +46,36 @@ def _tree(graph: RoomGraph):
             adj[c.b].append(c.a)
     ids = [r.id for r in graph.rooms]
     root = max(ids, key=lambda i: len(adj[i]))
-    parent = {root: None}
+    parent = {}
     children: dict[int, list[int]] = {i: [] for i in ids}
-    depth = {root: 0}
-    order = [root]
-    seen = {root}
-    dq = deque([root])
-    while dq:
-        u = dq.popleft()
-        for v in sorted(adj[u]):
-            if v not in seen:
-                seen.add(v)
-                parent[v] = u
-                children[u].append(v)
-                depth[v] = depth[u] + 1
-                order.append(v)
-                dq.append(v)
-    # disconnected remnants (shouldn't happen for a tree) get their own roots
-    for i in ids:
-        if i not in seen:
-            parent[i] = None
-            depth[i] = 0
-            order.append(i)
-            seen.add(i)
+    depth, order, seen = {}, [], set()
+    for origin in [root] + [i for i in ids if i != root]:
+        if origin in seen:
+            continue
+        parent[origin], depth[origin] = None, 0
+        order.append(origin)
+        seen.add(origin)
+        dq = deque([origin])
+        while dq:
+            u = dq.popleft()
+            for v in sorted(adj[u]):
+                if v not in seen:
+                    seen.add(v)
+                    parent[v] = u
+                    children[u].append(v)
+                    depth[v] = depth[u] + 1
+                    order.append(v)
+                    dq.append(v)
     return root, order, parent, children, depth
 
 
 def radial_layout(graph: RoomGraph, seed: int = 0) -> dict[int, tuple[float, float]]:
-    """Non-crossing tree layout: every subtree owns a disjoint angular wedge,
-    nodes sit on depth rings. Crossing-free BY CONSTRUCTION (so corridors don't
-    get dropped -> no inaccessible rooms), with wedge-scaled jitter so it reads
-    organic instead of a bullseye. Returns {room_id: (cx, cy)}."""
+    """Place a spanning forest in angular wedges with bounded separation.
+
+    All graph nodes get positions, including disconnected components. This is
+    a layout heuristic, not a crossing-free embedding of cyclic graphs: the
+    assembler must still verify every requested corridor. Returns room centers.
+    """
     rng = random.Random(seed)
     ids = [r.id for r in graph.rooms]
     if not ids:
@@ -83,27 +91,42 @@ def radial_layout(graph: RoomGraph, seed: int = 0) -> dict[int, tuple[float, flo
             demand[u] = max(1, sum(demand[c] for c in children[u]))
 
     ring = 2.4 * (sum(rad.values()) / len(ids)) + 220.0   # radius per depth level
+    room_by_id = {room.id: room for room in graph.rooms}
+    edge_gaps: dict[frozenset[int], float] = {}
+    for edge in graph.connections:
+        if edge.kind != 'teleport' and edge.a in rad and edge.b in rad and edge.a != edge.b:
+            stair_run = abs(room_by_id[edge.a].floor_h - room_by_id[edge.b].floor_h) * 3 + 192
+            ring = max(ring, rad[edge.a] + rad[edge.b] + stair_run)
+            key = frozenset((edge.a, edge.b))
+            edge_gaps[key] = max(edge_gaps.get(key, 64.0), float(stair_run))
     pos: dict[int, list] = {}
-    interval = {root: (0.0, 2 * math.pi)}
-    pos[root] = [0.0, 0.0]
+    roots = [i for i in order if parent[i] is None]
+    interval = {i: (0.0, 2 * math.pi) for i in roots}
+    separation = 2 * (max(depth.values()) * ring + max(rad.values())) + 64
+    origins = {i: (index * separation, 0.0) for index, i in enumerate(roots)}
     for u in order:
         a0, a1 = interval.get(u, (0.0, 2 * math.pi))
         width = a1 - a0
-        if parent[u] is not None:
+        if parent[u] is None:
+            pos[u] = list(origins[u])
+        else:
+            origins[u] = origins[parent[u]]
             ang = (a0 + a1) / 2 + rng.uniform(-0.16, 0.16) * width
             r = depth[u] * ring * (1.0 + rng.uniform(-0.12, 0.12))
-            pos[u] = [r * math.cos(ang), r * math.sin(ang)]
+            ox, oy = origins[u]
+            pos[u] = [ox + r * math.cos(ang), oy + r * math.sin(ang)]
         tot = sum(demand[c] for c in children[u]) or 1
         cur = a0
         for c in children[u]:                       # split arc among children
             w = width * demand[c] / tot
             interval[c] = (cur, cur + w)
             cur += w
-    _separate(pos, rad)                             # guarantee no room overlap
+    _separate(pos, rad, min_gaps=edge_gaps)         # guarantee no room overlap
     return {i: (pos[i][0], pos[i][1]) for i in ids}
 
 
-def _separate(pos: dict, rad: dict, iterations: int = 120) -> None:
+def _separate(pos: dict, rad: dict, iterations: int = 120,
+              min_gaps: dict[frozenset[int], float] | None = None) -> None:
     """Push rooms apart until their bounding circles are disjoint - once the
     circles clear, the real polygons (which sit inside them) cannot overlap.
     Radial layout separates centroids by wedge but real room shapes have extent
@@ -118,11 +141,19 @@ def _separate(pos: dict, rad: dict, iterations: int = 120) -> None:
                 ib = ids[b]
                 dx = pos[ia][0] - pos[ib][0]
                 dy = pos[ia][1] - pos[ib][1]
-                d = math.hypot(dx, dy) or 0.01
-                want = rad[ia] + rad[ib] + 64.0     # circles clear + corridor slack
+                d = math.hypot(dx, dy)
+                gap = min_gaps.get(frozenset((ia, ib)), 64.0) if min_gaps else 64.0
+                want = rad[ia] + rad[ib] + gap      # circles clear + corridor slack
                 if d < want:
                     f = (want - d) * 0.5
-                    ux, uy = dx / d, dy / d
+                    if d < 1e-9:
+                        # Coincident centers have no displacement direction.
+                        # A deterministic pair-specific normal breaks the tie
+                        # without touching the caller's RNG.
+                        angle = (a * len(ids) + b) * 2.399963229728653
+                        ux, uy = math.cos(angle), math.sin(angle)
+                    else:
+                        ux, uy = dx / d, dy / d
                     disp[ia][0] += ux * f
                     disp[ia][1] += uy * f
                     disp[ib][0] -= ux * f
@@ -133,59 +164,11 @@ def _separate(pos: dict, rad: dict, iterations: int = 120) -> None:
             pos[i][1] += disp[i][1]
         if not moved:
             break
-
-
-def add_loops(graph: RoomGraph, positions: dict[int, tuple[float, float]],
-              seed: int = 0, ratio: float = 0.5) -> int:
-    """Turn the radial tree into a graph with CYCLES by connecting angular
-    neighbours on the same depth ring - the natural "circle around" routes a
-    radial layout affords. These chords are short and tangential, so they carve
-    cleanly and any that would cross are dropped later by the assembler.
-    Mutates graph.connections; returns the number of loops added."""
-    ids = [i for i in positions]
-    if len(ids) < 4:
-        return 0
-    rng = random.Random(seed)
-    rad = {r.id: _radius(r) for r in graph.rooms}
-    ring = 2.4 * (sum(rad.values()) / len(rad)) + 220.0
-    have = {frozenset((c.a, c.b)) for c in graph.connections}
-
-    # group rooms by depth ring (radius from the layout centre), order by angle
-    rings: dict[int, list] = {}
-    for i in ids:
-        x, y = positions[i]
-        r = math.hypot(x, y)
-        rings.setdefault(round(r / ring), []).append((math.atan2(y, x), i))
-
-    cand = []
-    for k, members in rings.items():
-        if len(members) < 2:
-            continue
-        members.sort()
-        m = len(members)
-        wrap = m if m > 2 else m - 1          # close the full ring only if >2
-        for t in range(wrap):
-            a = members[t][1]
-            b = members[(t + 1) % m][1]
-            if a == b or frozenset((a, b)) in have:
-                continue
-            d = math.hypot(positions[a][0] - positions[b][0],
-                           positions[a][1] - positions[b][1])
-            if d > 2.4 * ring:                # skip long stringy loop chords
-                continue
-            cand.append((d, a, b))
-    cand.sort()                                # shortest chords first
-    budget = max(1, int(len(rings) * ratio) + len(ids) // 6)
-    added = 0
-    for d, a, b in cand:
-        if added >= budget:
-            break
-        if frozenset((a, b)) in have:
-            continue
-        graph.connections.append(Connection(a=a, b=b, kind="corridor", width=160))
-        have.add(frozenset((a, b)))
-        added += 1
-    return added
+    # Finite relaxation is not a proof of convergence. Reject any remaining
+    # overlap, allowing extra space for the assembler's integer XY rounding.
+    if any(math.dist(pos[ia], pos[ib]) < rad[ia] + rad[ib] + 2
+           for a, ia in enumerate(ids) for ib in ids[a + 1:]):
+        raise ValueError('room separation did not converge within the iteration budget')
 
 
 def force_layout(graph: RoomGraph, iterations: int = 400,
@@ -247,4 +230,5 @@ def force_layout(graph: RoomGraph, iterations: int = 400,
             pos[i][0] += dx / dd * step
             pos[i][1] += dy / dd * step
 
+    _separate(pos, rad)
     return {i: (pos[i][0], pos[i][1]) for i in ids}
